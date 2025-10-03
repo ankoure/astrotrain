@@ -1,0 +1,24 @@
+[project]
+name = "astrotrain"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "Andrew Kouré",email = "andrew@koure.org"}
+]
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "tensorflow (>=2.20.0,<3.0.0)",
+    "scikit-learn (>=1.7.2,<2.0.0)",
+    "pyarrow (>=21.0.0,<22.0.0)",
+    "numpy (>=2.3.3,<3.0.0)",
+    "pandas (>=2.3.3,<3.0.0)"
+]
+
+[tool.poetry]
+packages = [{include = "astrotrain", from = "src"}]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
