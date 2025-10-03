@@ -375,7 +375,7 @@ if __name__ == "__main__":
     # Example usage with multiple files
 
     # Get all parquet files (assumes daily files named like YYYY-MM-DD.parquet)
-    parquet_files = sorted(glob("data/*2019*.parquet"))
+    parquet_files = sorted(glob("data/*.parquet"))
 
     # Or single file for testing
     # parquet_files = ['MBTA_LAMP.parquet']
