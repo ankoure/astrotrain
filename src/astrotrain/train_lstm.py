@@ -7,13 +7,25 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 from sklearn.preprocessing import StandardScaler, LabelEncoder
-from sklearn.model_selection import train_test_split
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
 import pickle
 from typing import List, Tuple
 from glob import glob
+
+# Configure TensorFlow for better memory management
+gpus = tf.config.list_physical_devices('GPU')
+if gpus:
+    try:
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+    except RuntimeError as e:
+        print(f"GPU memory growth must be set before GPUs are used: {e}")
+
+# For CPU: limit the number of threads to prevent overallocation
+tf.config.threading.set_intra_op_parallelism_threads(4)
+tf.config.threading.set_inter_op_parallelism_threads(2)
 
 
 class CountdownClockLSTM:
@@ -27,7 +39,7 @@ class CountdownClockLSTM:
         """
         self.sequence_length = sequence_length
         self.prediction_horizon = prediction_horizon
-        self.model = None
+        self.model = keras.Sequential()
         self.feature_scaler = StandardScaler()
         self.target_scaler = StandardScaler()
         self.route_encoder = LabelEncoder()
@@ -46,20 +58,26 @@ class CountdownClockLSTM:
         print(f"Total records: {len(combined_df)}")
         return combined_df
 
-    def sequence_generator(self, parquet_files: List[str], batch_size: int = 32):
+    def sequence_generator(self, parquet_files: List[str], file_batch_size: int = 5,
+                           mini_batch_size: int = 64):
         """
-        Memory-efficient generator that yields batches of sequences from files.
+        Memory-efficient generator that yields mini-batches of sequences from files.
 
         Args:
             parquet_files: List of parquet file paths
-            batch_size: Number of files to load at once
+            file_batch_size: Number of files to load at once
+            mini_batch_size: Size of mini-batches to yield for training
 
         Yields:
-            Tuple of (X_batch, y_batch) arrays
+            Tuple of (X_batch, y_batch) arrays of size mini_batch_size
         """
-        for i in range(0, len(parquet_files), batch_size):
-            file_batch = parquet_files[i:i + batch_size]
-            print(f"\nProcessing files {i+1} to {min(i+batch_size, len(parquet_files))} of {len(parquet_files)}")
+        for i in range(0, len(parquet_files), file_batch_size):
+            file_batch = parquet_files[i : i + file_batch_size]
+            print(
+                f"\nProcessing files {i + 1} to "
+                f"{min(i + file_batch_size, len(parquet_files))} of "
+                f"{len(parquet_files)}"
+            )
 
             # Load and process this batch of files
             df = self.load_data(file_batch)
@@ -75,7 +93,10 @@ class CountdownClockLSTM:
             # Scale targets
             y_scaled = self.target_scaler.transform(y)
 
-            yield X_scaled, y_scaled
+            # Yield mini-batches from this data
+            for j in range(0, n_samples, mini_batch_size):
+                end_idx = min(j + mini_batch_size, n_samples)
+                yield X_scaled[j:end_idx], y_scaled[j:end_idx]
 
             # Clear memory
             del df, X, y, X_reshaped, X_scaled, y_scaled
@@ -83,35 +104,44 @@ class CountdownClockLSTM:
     def preprocess_data(self, df: pd.DataFrame) -> pd.DataFrame:
         """Clean and prepare data for modeling"""
         # Sort by trip and stop sequence
-        df = df.sort_values(['trip_id', 'stop_sequence']).reset_index(drop=True)
+        df = df.sort_values(["trip_id", "stop_sequence"]).reset_index(drop=True)
 
         # Create target variable: time until arrival (for countdown clock)
         # We'll predict travel_time_seconds to the next stop
-        df['target_travel_time'] = df.groupby('trip_id')['travel_time_seconds'].shift(-self.prediction_horizon)
+        df["target_travel_time"] = df.groupby("trip_id")["travel_time_seconds"].shift(
+            -self.prediction_horizon
+        )
 
         # Remove rows without target
-        df = df.dropna(subset=['target_travel_time'])
+        df = df.dropna(subset=["target_travel_time"])
 
         # Fill missing values with median for numeric columns
-        numeric_cols = ['travel_time_seconds', 'dwell_time_seconds',
-                       'headway_trunk_seconds', 'headway_branch_seconds',
-                       'scheduled_travel_time', 'scheduled_headway_trunk',
-                       'scheduled_headway_branch']
+        numeric_cols = [
+            "travel_time_seconds",
+            "dwell_time_seconds",
+            "headway_trunk_seconds",
+            "headway_branch_seconds",
+            "scheduled_travel_time",
+            "scheduled_headway_trunk",
+            "scheduled_headway_branch",
+        ]
 
         for col in numeric_cols:
             if col in df.columns:
                 df[col] = df[col].fillna(df[col].median())
 
         # Encode categorical variables
-        df['route_encoded'] = self.route_encoder.fit_transform(df['route_id'])
-        df['stop_encoded'] = self.stop_encoder.fit_transform(df['parent_station'])
+        df["route_encoded"] = self.route_encoder.fit_transform(df["route_id"])
+        df["stop_encoded"] = self.stop_encoder.fit_transform(df["parent_station"])
 
         # Create time-based features
-        df['hour_of_day'] = (df['start_time'] // 3600) % 24
-        df['day_of_week'] = pd.to_datetime(df['service_date'], format='%Y%m%d').dt.dayofweek
+        df["hour_of_day"] = (df["start_time"] // 3600) % 24
+        df["day_of_week"] = pd.to_datetime(
+            df["service_date"], format="%Y%m%d"
+        ).dt.dayofweek
 
         # Binary direction
-        df['direction_binary'] = df['direction_id'].astype(int)
+        df["direction_binary"] = df["direction_id"].astype(int)
 
         return df
 
@@ -119,27 +149,35 @@ class CountdownClockLSTM:
         """Create time series sequences for LSTM"""
         # Define features for the model
         self.feature_columns = [
-            'stop_sequence', 'travel_time_seconds', 'dwell_time_seconds',
-            'headway_trunk_seconds', 'headway_branch_seconds',
-            'scheduled_travel_time', 'scheduled_headway_trunk',
-            'route_encoded', 'stop_encoded', 'hour_of_day',
-            'day_of_week', 'direction_binary', 'stop_count'
+            "stop_sequence",
+            "travel_time_seconds",
+            "dwell_time_seconds",
+            "headway_trunk_seconds",
+            "headway_branch_seconds",
+            "scheduled_travel_time",
+            "scheduled_headway_trunk",
+            "route_encoded",
+            "stop_encoded",
+            "hour_of_day",
+            "day_of_week",
+            "direction_binary",
+            "stop_count",
         ]
 
         X_sequences = []
         y_targets = []
 
         # Group by trip to maintain temporal continuity
-        for trip_id, trip_df in df.groupby('trip_id'):
+        for trip_id, trip_df in df.groupby("trip_id"):
             if len(trip_df) < self.sequence_length + 1:
                 continue
 
             trip_features = trip_df[self.feature_columns].values
-            trip_targets = trip_df['target_travel_time'].values
+            trip_targets = trip_df["target_travel_time"].values
 
             # Create sliding windows
             for i in range(len(trip_df) - self.sequence_length):
-                X_sequences.append(trip_features[i:i + self.sequence_length])
+                X_sequences.append(trip_features[i : i + self.sequence_length])
                 y_targets.append(trip_targets[i + self.sequence_length - 1])
 
         X = np.array(X_sequences)
@@ -150,41 +188,43 @@ class CountdownClockLSTM:
 
     def build_model(self, input_shape: Tuple[int, int]):
         """Build LSTM neural network"""
-        model = keras.Sequential([
-            layers.Input(shape=input_shape),
-
-            # First LSTM layer with dropout
-            layers.LSTM(128, return_sequences=True),
-            layers.Dropout(0.2),
-
-            # Second LSTM layer
-            layers.LSTM(64, return_sequences=True),
-            layers.Dropout(0.2),
-
-            # Third LSTM layer
-            layers.LSTM(32, return_sequences=False),
-            layers.Dropout(0.2),
-
-            # Dense layers
-            layers.Dense(32, activation='relu'),
-            layers.Dropout(0.2),
-            layers.Dense(16, activation='relu'),
-
-            # Output layer (predicting travel time in seconds)
-            layers.Dense(1, activation='linear')
-        ])
+        model = keras.Sequential(
+            [
+                layers.Input(shape=input_shape),
+                # First LSTM layer with dropout
+                layers.LSTM(128, return_sequences=True),
+                layers.Dropout(0.2),
+                # Second LSTM layer
+                layers.LSTM(64, return_sequences=True),
+                layers.Dropout(0.2),
+                # Third LSTM layer
+                layers.LSTM(32, return_sequences=False),
+                layers.Dropout(0.2),
+                # Dense layers
+                layers.Dense(32, activation="relu"),
+                layers.Dropout(0.2),
+                layers.Dense(16, activation="relu"),
+                # Output layer (predicting travel time in seconds)
+                layers.Dense(1, activation="linear"),
+            ]
+        )
 
         model.compile(
             optimizer=keras.optimizers.Adam(learning_rate=0.001),
-            loss='mse',
-            metrics=['mae', 'mse']
+            loss="mse",
+            metrics=["mae", "mse"],
         )
 
         self.model = model
         return model
 
-    def train(self, parquet_files: List[str], epochs: int = 50, batch_size: int = 64,
-              file_batch_size: int = 30):
+    def train(
+        self,
+        parquet_files: List[str],
+        epochs: int = 50,
+        batch_size: int = 64,
+        file_batch_size: int = 30,
+    ):
         """
         Complete training pipeline with memory-efficient file batching.
 
@@ -192,11 +232,12 @@ class CountdownClockLSTM:
             parquet_files: List of parquet file paths
             epochs: Number of training epochs
             batch_size: Mini-batch size for SGD
-            file_batch_size: Number of parquet files to load at once (adjust based on RAM)
+            file_batch_size: Number of parquet files to load at once
+                           (adjust based on RAM)
         """
         # First pass: fit scalers and encoders on a sample of data
         print("Fitting preprocessors on initial data sample...")
-        sample_files = parquet_files[:min(10, len(parquet_files))]
+        sample_files = parquet_files[: min(10, len(parquet_files))]
         df_sample = self.load_data(sample_files)
         df_sample = self.preprocess_data(df_sample)
         X_sample, y_sample = self.create_sequences(df_sample)
@@ -215,16 +256,19 @@ class CountdownClockLSTM:
 
         # Callbacks
         early_stopping = keras.callbacks.EarlyStopping(
-            monitor='val_loss',
-            patience=10,
-            restore_best_weights=True
+            monitor="val_loss", patience=10, restore_best_weights=True
         )
 
         reduce_lr = keras.callbacks.ReduceLROnPlateau(
-            monitor='val_loss',
-            factor=0.5,
-            patience=5,
-            min_lr=0.00001
+            monitor="val_loss", factor=0.5, patience=5, min_lr=0.00001
+        )
+
+        model_checkpoint = keras.callbacks.ModelCheckpoint(
+            filepath="temp_best_weights.weights.h5",
+            monitor="val_loss",
+            save_best_only=True,
+            save_weights_only=True,
+            verbose=1
         )
 
         # Split files into train/val sets (time-based split)
@@ -232,62 +276,41 @@ class CountdownClockLSTM:
         train_files = parquet_files[:split_idx]
         val_files = parquet_files[split_idx:]
 
-        print(f"\nTraining on {len(train_files)} files, validating on {len(val_files)} files")
+        print(
+            f"\nTraining on {len(train_files)} files, "
+            f"validating on {len(val_files)} files"
+        )
 
-        # Train using generator
-        for epoch in range(epochs):
-            print(f"\n{'='*60}")
-            print(f"Epoch {epoch + 1}/{epochs}")
-            print(f"{'='*60}")
+        # Create data generators
+        train_generator = self.sequence_generator(
+            train_files, file_batch_size, batch_size)
+        val_generator = self.sequence_generator(
+            val_files, file_batch_size, batch_size)
 
-            # Training phase
-            train_losses = []
-            train_maes = []
-            for X_batch, y_batch in self.sequence_generator(train_files, file_batch_size):
-                history = self.model.fit(
-                    X_batch, y_batch,
-                    epochs=1,
-                    batch_size=batch_size,
-                    verbose=0
-                )
-                train_losses.append(history.history['loss'][0])
-                train_maes.append(history.history['mae'][0])
+        # Estimate steps per epoch (more accurate approximation)
+        # Each file batch might contain ~10-50k sequences, with mini_batch_size
+        avg_sequences_per_file_batch = 20000  # Conservative estimate
+        train_sequences = (len(train_files) * avg_sequences_per_file_batch
+                           // file_batch_size)
+        val_sequences = (len(val_files) * avg_sequences_per_file_batch
+                         // file_batch_size)
 
-            avg_train_loss = np.mean(train_losses)
-            avg_train_mae = np.mean(train_maes)
+        steps_per_epoch = max(10, train_sequences // batch_size)
+        validation_steps = max(5, val_sequences // batch_size)
 
-            # Validation phase
-            val_losses = []
-            val_maes = []
-            for X_batch, y_batch in self.sequence_generator(val_files, file_batch_size):
-                val_loss, val_mae, _ = self.model.evaluate(X_batch, y_batch, verbose=0)
-                val_losses.append(val_loss)
-                val_maes.append(val_mae)
-
-            avg_val_loss = np.mean(val_losses)
-            avg_val_mae = np.mean(val_maes)
-
-            print(f"Epoch {epoch + 1} - loss: {avg_train_loss:.4f} - mae: {avg_train_mae:.2f} - "
-                  f"val_loss: {avg_val_loss:.4f} - val_mae: {avg_val_mae:.2f}")
-
-            # Check early stopping (simplified)
-            if epoch > 0 and avg_val_loss < best_val_loss:
-                best_val_loss = avg_val_loss
-                patience_counter = 0
-                self.model.save_weights('temp_best_weights.weights.h5')
-            else:
-                patience_counter += 1
-                if patience_counter >= 10:
-                    print("\nEarly stopping triggered")
-                    self.model.load_weights('temp_best_weights.weights.h5')
-                    break
-
-            if epoch == 0:
-                best_val_loss = avg_val_loss
-                patience_counter = 0
+        # Train using fit with callbacks
+        history = self.model.fit(
+            train_generator,
+            steps_per_epoch=steps_per_epoch,
+            epochs=epochs,
+            validation_data=val_generator,
+            validation_steps=validation_steps,
+            callbacks=[early_stopping, reduce_lr, model_checkpoint],
+            verbose=1
+        )
 
         print("\nTraining complete!")
-        return None
+        return history
 
     def predict(self, X: np.ndarray) -> np.ndarray:
         """Make predictions and inverse transform to original scale"""
@@ -305,7 +328,7 @@ class CountdownClockLSTM:
 
         return y_pred
 
-    def save(self, path: str = 'models/countdown_lstm'):
+    def save(self, path: str = "models/countdown_lstm"):
         """Save model and preprocessing objects"""
         Path(path).mkdir(parents=True, exist_ok=True)
 
@@ -313,43 +336,46 @@ class CountdownClockLSTM:
         self.model.save(f"{path}/model.keras")
 
         # Save scalers and encoders
-        with open(f"{path}/scalers.pkl", 'wb') as f:
-            pickle.dump({
-                'feature_scaler': self.feature_scaler,
-                'target_scaler': self.target_scaler,
-                'route_encoder': self.route_encoder,
-                'stop_encoder': self.stop_encoder,
-                'feature_columns': self.feature_columns,
-                'sequence_length': self.sequence_length,
-                'prediction_horizon': self.prediction_horizon
-            }, f)
+        with open(f"{path}/scalers.pkl", "wb") as f:
+            pickle.dump(
+                {
+                    "feature_scaler": self.feature_scaler,
+                    "target_scaler": self.target_scaler,
+                    "route_encoder": self.route_encoder,
+                    "stop_encoder": self.stop_encoder,
+                    "feature_columns": self.feature_columns,
+                    "sequence_length": self.sequence_length,
+                    "prediction_horizon": self.prediction_horizon,
+                },
+                f,
+            )
 
         print(f"Model saved to {path}")
 
-    def load(self, path: str = 'models/countdown_lstm'):
+    def load(self, path: str = "models/countdown_lstm"):
         """Load model and preprocessing objects"""
         # Load model
         self.model = keras.models.load_model(f"{path}/model.keras")
 
         # Load scalers and encoders
-        with open(f"{path}/scalers.pkl", 'rb') as f:
+        with open(f"{path}/scalers.pkl", "rb") as f:
             saved_objects = pickle.load(f)
-            self.feature_scaler = saved_objects['feature_scaler']
-            self.target_scaler = saved_objects['target_scaler']
-            self.route_encoder = saved_objects['route_encoder']
-            self.stop_encoder = saved_objects['stop_encoder']
-            self.feature_columns = saved_objects['feature_columns']
-            self.sequence_length = saved_objects['sequence_length']
-            self.prediction_horizon = saved_objects['prediction_horizon']
+            self.feature_scaler = saved_objects["feature_scaler"]
+            self.target_scaler = saved_objects["target_scaler"]
+            self.route_encoder = saved_objects["route_encoder"]
+            self.stop_encoder = saved_objects["stop_encoder"]
+            self.feature_columns = saved_objects["feature_columns"]
+            self.sequence_length = saved_objects["sequence_length"]
+            self.prediction_horizon = saved_objects["prediction_horizon"]
 
         print(f"Model loaded from {path}")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     # Example usage with multiple files
 
     # Get all parquet files (assumes daily files named like YYYY-MM-DD.parquet)
-    parquet_files = sorted(glob('data/*.parquet'))
+    parquet_files = sorted(glob("data/*2019*.parquet"))
 
     # Or single file for testing
     # parquet_files = ['MBTA_LAMP.parquet']
@@ -360,13 +386,9 @@ if __name__ == '__main__':
     lstm = CountdownClockLSTM(sequence_length=10, prediction_horizon=1)
 
     # Train with file batching
-    # Adjust file_batch_size based on your RAM (30 files ~= 1-2GB depending on file size)
-    history = lstm.train(
-        parquet_files,
-        epochs=50,
-        batch_size=64,
-        file_batch_size=30
-    )
+    # Adjust file_batch_size based on your RAM
+    # (5 files should be much more memory-friendly)
+    history = lstm.train(parquet_files, epochs=50, batch_size=64, file_batch_size=5)
 
     # Save
-    lstm.save('models/countdown_lstm')
+    lstm.save("models/countdown_lstm")
