@@ -1,5 +1,26 @@
+# Data files
 data/*.parquet
+data/*.csv
+
+# Model artifacts (temporary and large files)
 *.weights.h5
+temp_best_weights.weights.h5
+*.keras
+*.pkl
+
+# Model directories (structure tracked, contents ignored)
+models/*/model.keras
+models/*/scalers.pkl
+models/*/weights/
+models/*/checkpoints/
+models/*/logs/
+models/*/tensorboard/
+
+# Training artifacts
+training_logs/
+experiments/
+mlruns/
+outputs/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
