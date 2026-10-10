@@ -15,7 +15,7 @@ from typing import List, Tuple
 from glob import glob
 
 # Configure TensorFlow for better memory management
-gpus = tf.config.list_physical_devices('GPU')
+gpus = tf.config.list_physical_devices("GPU")
 if gpus:
     try:
         for gpu in gpus:
@@ -73,8 +73,12 @@ class CountdownClockLSTM:
         self.stop_encoder.fit(list(stations))
         print(f"Encoded {len(routes)} routes and {len(stations)} stations")
 
-    def sequence_generator(self, parquet_files: List[str], file_batch_size: int = 5,
-                           mini_batch_size: int = 64):
+    def sequence_generator(
+        self,
+        parquet_files: List[str],
+        file_batch_size: int = 5,
+        mini_batch_size: int = 64,
+    ):
         """
         Memory-efficient generator that yields mini-batches of sequences from files.
 
@@ -287,7 +291,7 @@ class CountdownClockLSTM:
             monitor="val_loss",
             save_best_only=True,
             save_weights_only=True,
-            verbose=1
+            verbose=1,
         )
 
         # Split files into train/val sets (time-based split)
@@ -321,7 +325,7 @@ class CountdownClockLSTM:
             epochs=epochs,
             validation_data=val_dataset,
             callbacks=[early_stopping, reduce_lr, model_checkpoint],
-            verbose=1
+            verbose=1,
         )
 
         print("\nTraining complete!")
