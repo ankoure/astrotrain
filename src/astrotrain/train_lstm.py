@@ -35,6 +35,10 @@ class CountdownClockLSTM:
     # same timetable, and some Green Line trips appear under two branches.
     TRIP_KEY = ["service_date", "route_id", "trip_id"]
 
+    # Travel times above this between adjacent stops are recording errors (mostly
+    # trains sitting at a terminal, logged as hours-long trips), not real delays
+    MAX_TRAVEL_TIME_SECONDS = 30 * 60
+
     def __init__(
         self,
         sequence_length: int = 10,
@@ -150,18 +154,27 @@ class CountdownClockLSTM:
         # Sort by trip and stop sequence
         df = df.sort_values([*self.TRIP_KEY, "stop_sequence"]).reset_index(drop=True)
 
+        # Treat impossible travel times as missing
+        df["travel_time_seconds"] = df["travel_time_seconds"].where(
+            df["travel_time_seconds"] <= self.MAX_TRAVEL_TIME_SECONDS
+        )
+
         # Create target variable: time until arrival (for countdown clock)
-        # We'll predict travel_time_seconds to the next stop
+        # We'll predict travel_time_seconds to the next stop. Rows are kept even
+        # when that's unknown, so trips stay intact; create_sequences skips them.
         df["target_travel_time"] = df.groupby(self.TRIP_KEY)[
             "travel_time_seconds"
         ].shift(-self.prediction_horizon)
 
-        # Remove rows without target
-        df = df.dropna(subset=["target_travel_time"])
+        # Flag missing travel times (usually the first stop, plus recording gaps)
+        # and fill them with the scheduled time, or 0 when there isn't one
+        df["travel_time_missing"] = df["travel_time_seconds"].isna().astype(int)
+        df["travel_time_seconds"] = (
+            df["travel_time_seconds"].fillna(df["scheduled_travel_time"]).fillna(0)
+        )
 
-        # Fill missing values with median for numeric columns
+        # Fill missing values with median for the other numeric columns
         numeric_cols = [
-            "travel_time_seconds",
             "dwell_time_seconds",
             "headway_trunk_seconds",
             "headway_branch_seconds",
@@ -195,6 +208,7 @@ class CountdownClockLSTM:
         self.feature_columns = [
             "stop_sequence",
             "travel_time_seconds",
+            "travel_time_missing",
             "dwell_time_seconds",
             "headway_trunk_seconds",
             "headway_branch_seconds",
@@ -219,11 +233,14 @@ class CountdownClockLSTM:
             trip_features = trip_df[self.feature_columns].values
             trip_targets = trip_df["target_travel_time"].values
 
-            # Create sliding windows. Every row already has a target (the next
-            # stop's travel time), so a window can end on the trip's last row.
+            # Create sliding windows over consecutive stops, ending on each stop
+            # whose next travel time is known
             for i in range(len(trip_df) - self.sequence_length + 1):
+                target = trip_targets[i + self.sequence_length - 1]
+                if np.isnan(target):
+                    continue
                 X_sequences.append(trip_features[i : i + self.sequence_length])
-                y_targets.append(trip_targets[i + self.sequence_length - 1])
+                y_targets.append(target)
 
         X = np.array(X_sequences)
         y = np.array(y_targets).reshape(-1, 1)
@@ -256,7 +273,9 @@ class CountdownClockLSTM:
 
         model.compile(
             optimizer=keras.optimizers.Adam(learning_rate=0.001),
-            loss="mse",
+            # Huber is squared error for small misses and linear past 1 std, so
+            # the rare real delays of 10+ minutes don't dominate training
+            loss=keras.losses.Huber(delta=1.0),
             metrics=["mae", "mse"],
         )
 
