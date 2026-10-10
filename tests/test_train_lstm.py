@@ -91,13 +91,48 @@ def test_trips_sharing_an_id_stay_separate(lstm, column, values):
     assert all(len(set(window % 10)) == 1 for window in travel_time)
 
 
-def test_missing_values_filled_with_median(lstm):
-    df = lamp_frame(20250901, "Red", stations(0, 4), n_trips=1)
-    df["dwell_time_seconds"] = [10.0, np.nan, 30.0, 50.0]
+def test_missing_values_filled_with_training_median(lstm):
+    training = lamp_frame(20250901, "Red", stations(0, 4), n_trips=1)
+    training["dwell_time_seconds"] = [10.0, 20.0, 30.0, 40.0]
+    lstm.fit_fill_values(training)
+    df = lamp_frame(20250902, "Red", stations(0, 4), n_trips=1)
+    df["dwell_time_seconds"] = [100.0, np.nan, 300.0, 500.0]
 
     out = lstm.preprocess_data(df)
 
-    assert out["dwell_time_seconds"].tolist() == [10.0, 30.0, 30.0, 50.0]
+    # The training median (25), not this batch's (300)
+    assert out["dwell_time_seconds"].tolist() == [100.0, 25.0, 300.0, 500.0]
+
+
+def test_column_missing_from_a_whole_batch_is_still_filled(lstm):
+    # Regression: filling with the batch median left these as NaN for a batch
+    # with no branch headways at all (like a Blue Line-only batch), which made
+    # every prediction for it NaN
+    df = lamp_frame(20250901, "Blue", stations(0, 5), n_trips=2)
+    df["headway_branch_seconds"] = np.nan
+    df["scheduled_headway_branch"] = np.nan
+
+    X, _ = lstm.create_sequences(lstm.preprocess_data(df))
+
+    assert len(X) > 0
+    assert not np.isnan(X).any()
+
+
+def test_fit_fill_values_uses_zero_for_a_column_with_no_values(lstm):
+    df = lamp_frame(20250901, "Blue", stations(0, 3), n_trips=1)
+    df["headway_branch_seconds"] = np.nan
+
+    lstm.fit_fill_values(df)
+
+    assert lstm.fill_values["headway_branch_seconds"] == 0
+
+
+def test_preprocess_before_fitting_fill_values_raises(parquet_files):
+    lstm = CountdownClockLSTM()
+    lstm.fit_encoders(parquet_files)
+
+    with pytest.raises(RuntimeError, match="fit_fill_values"):
+        lstm.preprocess_data(lamp_frame(20250901, "Red", stations(0, 3), n_trips=1))
 
 
 def test_impossible_travel_times_are_treated_as_missing(lstm):
@@ -260,6 +295,7 @@ def test_same_seed_gives_same_shuffle(parquet_files):
     def first_pass(seed):
         lstm = CountdownClockLSTM(sequence_length=3, seed=seed)
         lstm.fit_encoders(parquet_files)
+        lstm.fit_fill_values(lstm.load_data(parquet_files))
         fit_scalers(lstm, parquet_files)
         return windows(lstm.sequence_generator(parquet_files, 2, 8, shuffle=True))
 
@@ -316,3 +352,4 @@ def test_save_and_load_round_trip(lstm, parquet_files, tmp_path):
     assert loaded.sequence_length == lstm.sequence_length
     assert loaded.feature_columns == lstm.feature_columns
     assert list(loaded.stop_encoder.classes_) == list(lstm.stop_encoder.classes_)
+    assert loaded.fill_values == lstm.fill_values

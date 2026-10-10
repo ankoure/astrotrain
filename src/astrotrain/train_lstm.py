@@ -39,6 +39,16 @@ class CountdownClockLSTM:
     # trains sitting at a terminal, logged as hours-long trips), not real delays
     MAX_TRAVEL_TIME_SECONDS = 30 * 60
 
+    # Numeric columns filled with their training median when missing
+    FILLED_COLUMNS = [
+        "dwell_time_seconds",
+        "headway_trunk_seconds",
+        "headway_branch_seconds",
+        "scheduled_travel_time",
+        "scheduled_headway_trunk",
+        "scheduled_headway_branch",
+    ]
+
     def __init__(
         self,
         sequence_length: int = 10,
@@ -60,6 +70,7 @@ class CountdownClockLSTM:
         self.target_scaler = StandardScaler()
         self.route_encoder = LabelEncoder()
         self.stop_encoder = LabelEncoder()
+        self.fill_values = {}
         self.feature_columns = []
 
     def load_data(self, parquet_files: List[str]) -> pd.DataFrame:
@@ -88,6 +99,15 @@ class CountdownClockLSTM:
         self.route_encoder.fit(list(routes))
         self.stop_encoder.fit(list(stations))
         print(f"Encoded {len(routes)} routes and {len(stations)} stations")
+
+    def fit_fill_values(self, df: pd.DataFrame):
+        """
+        Learn the value used for each missing numeric column from raw training data,
+        so every batch (and prediction) is filled the same way. A column that's empty
+        in the training data is filled with 0.
+        """
+        medians = df[self.FILLED_COLUMNS].median()
+        self.fill_values = medians.fillna(0).to_dict()
 
     def sequence_generator(
         self,
@@ -151,6 +171,11 @@ class CountdownClockLSTM:
 
     def preprocess_data(self, df: pd.DataFrame) -> pd.DataFrame:
         """Clean and prepare data for modeling"""
+        if not self.fill_values:
+            raise RuntimeError(
+                "Fill values aren't fit yet: call fit_fill_values() or load a model"
+            )
+
         # Sort by trip and stop sequence
         df = df.sort_values([*self.TRIP_KEY, "stop_sequence"]).reset_index(drop=True)
 
@@ -173,19 +198,8 @@ class CountdownClockLSTM:
             df["travel_time_seconds"].fillna(df["scheduled_travel_time"]).fillna(0)
         )
 
-        # Fill missing values with median for the other numeric columns
-        numeric_cols = [
-            "dwell_time_seconds",
-            "headway_trunk_seconds",
-            "headway_branch_seconds",
-            "scheduled_travel_time",
-            "scheduled_headway_trunk",
-            "scheduled_headway_branch",
-        ]
-
-        for col in numeric_cols:
-            if col in df.columns:
-                df[col] = df[col].fillna(df[col].median())
+        # Fill the other numeric columns with their training medians
+        df = df.fillna(self.fill_values)
 
         # Encode categorical variables (encoders are fit once in fit_encoders)
         df["route_encoded"] = self.route_encoder.transform(df["route_id"])
@@ -303,9 +317,10 @@ class CountdownClockLSTM:
         print("Fitting encoders on all files...")
         self.fit_encoders(parquet_files)
 
-        print("Fitting scalers on initial data sample...")
+        print("Fitting fill values and scalers on initial data sample...")
         sample_files = parquet_files[: min(10, len(parquet_files))]
         df_sample = self.load_data(sample_files)
+        self.fit_fill_values(df_sample)
         df_sample = self.preprocess_data(df_sample)
         X_sample, y_sample = self.create_sequences(df_sample)
 
@@ -410,6 +425,7 @@ class CountdownClockLSTM:
                     "target_scaler": self.target_scaler,
                     "route_encoder": self.route_encoder,
                     "stop_encoder": self.stop_encoder,
+                    "fill_values": self.fill_values,
                     "feature_columns": self.feature_columns,
                     "sequence_length": self.sequence_length,
                     "prediction_horizon": self.prediction_horizon,
@@ -431,6 +447,7 @@ class CountdownClockLSTM:
             self.target_scaler = saved_objects["target_scaler"]
             self.route_encoder = saved_objects["route_encoder"]
             self.stop_encoder = saved_objects["stop_encoder"]
+            self.fill_values = saved_objects["fill_values"]
             self.feature_columns = saved_objects["feature_columns"]
             self.sequence_length = saved_objects["sequence_length"]
             self.prediction_horizon = saved_objects["prediction_horizon"]
