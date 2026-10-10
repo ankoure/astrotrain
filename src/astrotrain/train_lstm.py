@@ -80,13 +80,15 @@ class CountdownClockLSTM:
 
     def __init__(
         self,
-        sequence_length: int = 10,
+        sequence_length: int = 5,
         prediction_horizon: int = 10,
         seed: Optional[int] = None,
     ):
         """
         Args:
-            sequence_length: Number of historical stops to use as input
+            sequence_length: Number of historical stops to use as input. A train
+                             gets no prediction until it has passed this many, so
+                             shorter windows cover more of each trip
             prediction_horizon: Number of stops ahead to predict arrival at; the
                                 model has one output per stop (1, 2, ... ahead)
             seed: Seed for shuffling training data (None for a different
@@ -557,7 +559,7 @@ if __name__ == "__main__":
     print(f"Found {len(parquet_files)} parquet files")
 
     # Initialize model
-    lstm = CountdownClockLSTM(sequence_length=10, prediction_horizon=10)
+    lstm = CountdownClockLSTM(sequence_length=5, prediction_horizon=10)
 
     # Train with file batching
     # Adjust file_batch_size based on your RAM
