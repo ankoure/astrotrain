@@ -2,8 +2,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from astrotrain.train_lstm import CountdownClockLSTM, keras
-from tests.lamp_data import lamp_frame, stations
+from astrotrain.train_lstm import CountdownClockLSTM, keras, masked_huber, masked_mae
+from tests.lamp_data import lamp_frame, stations, with_timestamps
 
 
 def fit_scalers(lstm, parquet_files):
@@ -41,14 +41,15 @@ def test_station_codes_match_across_file_batches(lstm, parquet_files):
 
 
 def known_targets(out, by):
-    """Targets per group, leaving out the stops whose next travel time is unknown"""
-    known = out.dropna(subset=["target_travel_time"])
-    return known.groupby(by)["target_travel_time"].apply(list).to_dict()
+    """target_1 per group, leaving out the stops where it's unknown"""
+    known = out.dropna(subset=["target_1"])
+    return known.groupby(by)["target_1"].apply(list).to_dict()
 
 
 def test_target_is_next_stops_travel_time_within_each_trip(lstm):
     df = lamp_frame(20250901, "Red", stations(0, 3), n_trips=2)
     df["travel_time_seconds"] = [10.0, 20.0, 30.0, 11.0, 21.0, 31.0]
+    df = with_timestamps(df)
     df = df.sample(frac=1, random_state=0)  # preprocess_data should restore order
 
     out = lstm.preprocess_data(df)
@@ -59,7 +60,7 @@ def test_target_is_next_stops_travel_time_within_each_trip(lstm):
     }
     # Each trip's last stop has no next stop, rather than borrowing the
     # following trip's first travel time
-    assert out.groupby("trip_id").tail(1)["target_travel_time"].isna().all()
+    assert out.groupby("trip_id").tail(1)["target_1"].isna().all()
 
 
 @pytest.mark.parametrize(
@@ -77,7 +78,9 @@ def test_trips_sharing_an_id_stay_separate(lstm, column, values):
     first["travel_time_seconds"] = [10.0, 20.0, 30.0, 40.0, 50.0]
     second["travel_time_seconds"] = [11.0, 21.0, 31.0, 41.0, 51.0]
 
-    out = lstm.preprocess_data(pd.concat([first, second]))
+    out = lstm.preprocess_data(
+        pd.concat([with_timestamps(first), with_timestamps(second)])
+    )
     X, _ = lstm.create_sequences(out)
 
     assert known_targets(out, column) == {
@@ -139,13 +142,13 @@ def test_impossible_travel_times_are_treated_as_missing(lstm):
     df = lamp_frame(20250901, "Red", stations(0, 5), n_trips=1)
     df["travel_time_seconds"] = [10.0, 20.0, 64486.0, 40.0, 50.0]
 
-    out = lstm.preprocess_data(df)
+    out = lstm.preprocess_data(with_timestamps(df))
 
     # Filled from the schedule (120s) and flagged, and never used as a target
     assert out["travel_time_seconds"].tolist() == [10.0, 20.0, 120.0, 40.0, 50.0]
     assert out["travel_time_missing"].tolist() == [0, 0, 1, 0, 0]
     unknown = [False, True, False, False, True]
-    assert out["target_travel_time"].isna().tolist() == unknown
+    assert out["target_1"].isna().tolist() == unknown
 
 
 @pytest.mark.parametrize(
@@ -191,7 +194,7 @@ def test_sequence_window_and_target(lstm):
     df = lamp_frame(20250901, "Red", stations(0, 6), n_trips=1)
     df["travel_time_seconds"] = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0]
 
-    X, y = lstm.create_sequences(lstm.preprocess_data(df))
+    X, y = lstm.create_sequences(lstm.preprocess_data(with_timestamps(df)))
 
     # Each window is 3 consecutive stops; the target is the travel time to the
     # stop right after the window
@@ -233,7 +236,7 @@ def test_return_index_points_at_each_windows_last_row(lstm):
     last_stops = X[:, -1, lstm.feature_columns.index("stop_sequence")]
     assert len(end_rows) == len(X) == len(y)
     assert df.loc[end_rows, "stop_sequence"].tolist() == last_stops.tolist()
-    assert df.loc[end_rows, "target_travel_time"].tolist() == y.ravel().tolist()
+    assert df.loc[end_rows, "target_1"].tolist() == y.ravel().tolist()
 
 
 def test_windows_never_span_two_trips(lstm):
@@ -245,11 +248,27 @@ def test_windows_never_span_two_trips(lstm):
     assert (np.diff(stop_sequence, axis=1) == 1).all()
 
 
-def test_gap_mid_trip_skips_only_the_window_with_no_target(lstm):
-    # Regression: the stop before a missing travel time used to be dropped, so
-    # later windows silently jumped over it
+def test_recording_gap_keeps_the_target_when_the_arrival_was_recorded(lstm):
+    # A missing travel time usually means leaving the previous stop wasn't
+    # recorded but arriving was, so the target is still known from timestamps
     df = lamp_frame(20250901, "Red", stations(0, 7), n_trips=1)
     df["travel_time_seconds"] = [10.0, 20.0, 30.0, np.nan, 50.0, 60.0, 70.0]
+    df = with_timestamps(df)  # reaches stop 3 its scheduled 120s after stop 2
+
+    X, y = lstm.create_sequences(lstm.preprocess_data(df))
+
+    stop_sequence = X[:, :, lstm.feature_columns.index("stop_sequence")]
+    assert stop_sequence.tolist() == [[0, 1, 2], [1, 2, 3], [2, 3, 4], [3, 4, 5]]
+    assert y.tolist() == [[120.0], [50.0], [60.0], [70.0]]
+
+
+def test_window_with_no_known_target_is_skipped_and_others_stay_consecutive(lstm):
+    # Regression: the stop before a missing value used to be dropped, so later
+    # windows silently jumped over it
+    df = lamp_frame(20250901, "Red", stations(0, 7), n_trips=1)
+    df["travel_time_seconds"] = [10.0, 20.0, 30.0, np.nan, 50.0, 60.0, 70.0]
+    df = with_timestamps(df)
+    df.loc[3, "stop_timestamp"] = np.nan  # the arrival wasn't recorded either
 
     X, y = lstm.create_sequences(lstm.preprocess_data(df))
 
@@ -264,6 +283,93 @@ def test_gap_mid_trip_skips_only_the_window_with_no_target(lstm):
         [120.0, 50.0, 60.0],
     ]
     assert y.tolist() == [[50.0], [60.0], [70.0]]
+
+
+# --- predicting several stops ahead ---
+
+
+def trip_with(lstm3, travel, dwell=None, scheduled=None):
+    """One trip with the given times, preprocessed"""
+    df = lamp_frame(20250901, "Red", stations(0, len(travel)), n_trips=1)
+    df["travel_time_seconds"] = travel
+    if dwell is not None:
+        df["dwell_time_seconds"] = dwell
+    if scheduled is not None:
+        df["scheduled_travel_time"] = scheduled
+    return lstm3.preprocess_data(with_timestamps(df))
+
+
+def test_targets_are_time_from_leaving_to_arriving_k_stops_ahead(lstm3):
+    out = trip_with(
+        lstm3,
+        travel=[10.0, 20.0, 30.0, 40.0, 50.0, 60.0],
+        dwell=[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+    )
+
+    targets = out[lstm3.target_columns]
+    # From leaving stop 0: travel to 1; + dwell at 1 + travel to 2; + dwell at 2
+    # + travel to 3
+    assert targets.loc[0].tolist() == [20.0, 20 + 2 + 30.0, 20 + 2 + 30 + 3 + 40.0]
+    # Stops past the end of the trip are unknown
+    assert targets.loc[3].tolist()[:2] == [50.0, 50 + 5 + 60.0]
+    assert targets.loc[3].isna().tolist() == [False, False, True]
+    assert targets.loc[5].isna().all()
+
+
+def test_targets_through_a_recording_error_are_unknown(lstm3):
+    out = trip_with(lstm3, travel=[10.0, 20.0, 30.0, 64486.0, 50.0, 60.0])
+
+    targets = out[lstm3.target_columns]
+    # Leaving stop 0, stops 1 and 2 are fine but the way to stop 3 isn't
+    assert targets.loc[0].isna().tolist() == [False, False, True]
+    # Leaving stop 2, everything passes through the bad leg
+    assert targets.loc[2].isna().all()
+    assert targets.loc[3, "target_1"] == 50.0
+
+
+def test_scheduled_targets_sum_scheduled_legs_minus_the_dwell_done(lstm3):
+    out = trip_with(
+        lstm3,
+        travel=[10.0, 20.0, 30.0, 40.0, 50.0],
+        dwell=[1.0, 2.0, 3.0, 4.0, 5.0],
+        scheduled=[100.0, 110.0, 120.0, 130.0, 140.0],
+    )
+
+    # Scheduled times run arrival to arrival, so leaving stop 0 after a 1s
+    # dwell, the schedule expects stop 1 in 110 - 1 seconds
+    assert out.loc[0, lstm3.scheduled_target_columns].tolist() == [
+        110 - 1.0,
+        110 + 120 - 1.0,
+        110 + 120 + 130 - 1.0,
+    ]
+
+
+def test_windows_with_some_unknown_targets_are_kept(lstm3):
+    out = trip_with(lstm3, travel=[10.0, 20.0, 30.0, 40.0, 50.0, 60.0])
+
+    _, y = lstm3.create_sequences(out)
+
+    # Windows end on stops 2-4; the trip's last stop has nothing ahead
+    assert y.shape == (3, 3)
+    assert np.isnan(y).tolist() == [
+        [False, False, False],
+        [False, False, True],
+        [False, True, True],
+    ]
+
+
+def test_masked_loss_and_metric_ignore_unknown_targets():
+    y_true = np.array([[1.0, np.nan], [2.0, 3.0]], dtype="float32")
+    y_pred = np.array([[0.0, 5.0], [2.0, 1.0]], dtype="float32")
+
+    loss = keras.ops.convert_to_numpy(masked_huber(y_true, y_pred))
+    mae = keras.ops.convert_to_numpy(masked_mae(y_true, y_pred))
+
+    # Huber: a miss of 1 is 0.5, a miss of 2 is 1.5 (linear past delta=1), and
+    # the unknown target adds nothing; averaged over each row's 2 outputs
+    np.testing.assert_allclose(loss, [0.25, 0.75])
+    # MAE averages over known targets only: row 1 has one miss of 1
+    np.testing.assert_allclose(mae, [1.0, 1.0])
 
 
 # --- sequence_generator / train ---
@@ -304,7 +410,7 @@ def test_shuffle_changes_order_each_pass_but_not_contents(lstm, parquet_files):
 
 def test_same_seed_gives_same_shuffle(parquet_files):
     def first_pass(seed):
-        lstm = CountdownClockLSTM(sequence_length=3, seed=seed)
+        lstm = CountdownClockLSTM(sequence_length=3, prediction_horizon=3, seed=seed)
         lstm.fit_encoders(parquet_files)
         lstm.fit_fill_values(lstm.load_data(parquet_files))
         fit_scalers(lstm, parquet_files)
@@ -345,22 +451,48 @@ def test_every_epoch_trains_on_all_files(lstm, parquet_files, tmp_path, monkeypa
     assert batches_per_epoch == [expected] * 3
 
 
+@pytest.mark.filterwarnings("ignore:Your input ran out of data")
+def test_training_with_unknown_far_targets_has_finite_loss(
+    lstm3, parquet_files, tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+
+    history = lstm3.train(parquet_files, epochs=2, batch_size=8, file_batch_size=2)
+
+    assert np.isfinite(history.history["loss"]).all()
+    assert np.isfinite(history.history["val_loss"]).all()
+
+
+def test_training_fails_clearly_when_no_trip_reaches_the_horizon(
+    parquet_files, tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    # The synthetic trips have 8 stops and the earliest window ends on stop 2,
+    # so 5 is the furthest ahead any window reaches
+    lstm = CountdownClockLSTM(sequence_length=3, prediction_horizon=6, seed=0)
+
+    with pytest.raises(ValueError, match="reach 6 stops ahead"):
+        lstm.train(parquet_files, epochs=1, batch_size=8, file_batch_size=2)
+
+
 # --- save / load ---
 
 
 # The model is saved untrained, so there's no optimizer state to restore
 @pytest.mark.filterwarnings("ignore:Skipping variable loading for optimizer")
-def test_save_and_load_round_trip(lstm, parquet_files, tmp_path):
-    X, _ = fit_scalers(lstm, parquet_files)
-    lstm.build_model(input_shape=X.shape[1:])
-    expected = lstm.predict(X)
+def test_save_and_load_round_trip(lstm3, parquet_files, tmp_path):
+    X, _ = fit_scalers(lstm3, parquet_files)
+    lstm3.build_model(input_shape=X.shape[1:])
+    expected = lstm3.predict(X)
 
-    lstm.save(str(tmp_path / "model"))
+    lstm3.save(str(tmp_path / "model"))
     loaded = CountdownClockLSTM()
     loaded.load(str(tmp_path / "model"))
 
+    assert expected.shape == (len(X), 3)
     np.testing.assert_allclose(loaded.predict(X), expected, rtol=1e-5)
-    assert loaded.sequence_length == lstm.sequence_length
-    assert loaded.feature_columns == lstm.feature_columns
-    assert list(loaded.stop_encoder.classes_) == list(lstm.stop_encoder.classes_)
-    assert loaded.fill_values == lstm.fill_values
+    assert loaded.prediction_horizon == 3
+    assert loaded.sequence_length == lstm3.sequence_length
+    assert loaded.feature_columns == lstm3.feature_columns
+    assert list(loaded.stop_encoder.classes_) == list(lstm3.stop_encoder.classes_)
+    assert loaded.fill_values == lstm3.fill_values

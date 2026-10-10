@@ -41,7 +41,33 @@ def lamp_frame(
                     "scheduled_headway_branch": 600.0,
                 }
             )
-    return pd.DataFrame(rows)
+    return with_timestamps(pd.DataFrame(rows))
+
+
+def with_timestamps(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Set stop_timestamp (arrival) and move_timestamp (leaving the previous stop)
+    from the travel and dwell times, as LAMP relates them. Call again after
+    changing those. A missing travel time is a recording gap: move_timestamp is
+    left missing and the clock advances by the scheduled time instead.
+    """
+    df = df.copy()
+    df["stop_timestamp"] = np.nan
+    df["move_timestamp"] = np.nan
+    for _, trip in df.groupby(["service_date", "route_id", "trip_id"], sort=False):
+        clock = 1_790_000_000.0 + trip["start_time"].iloc[0]
+        previous_dwell = None
+        for idx, row in trip.iterrows():
+            if previous_dwell is not None:
+                departed = clock + previous_dwell
+                if np.isnan(row["travel_time_seconds"]):
+                    clock = departed + row["scheduled_travel_time"]
+                else:
+                    df.loc[idx, "move_timestamp"] = departed
+                    clock = departed + row["travel_time_seconds"]
+            df.loc[idx, "stop_timestamp"] = clock
+            previous_dwell = np.nan_to_num(row["dwell_time_seconds"])
+    return df
 
 
 def write_daily_files(directory: Path, n_days: int = 5) -> list[str]:

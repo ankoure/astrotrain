@@ -1,6 +1,7 @@
 """
 LSTM Model for MBTA Countdown Clock Predictions
-Trains on historical LAMP data to predict vehicle arrival times
+Trains on historical LAMP data to predict vehicle arrival times: from the moment a
+train leaves a stop, how long until it arrives at each of the next several stops
 """
 
 import pandas as pd
@@ -8,8 +9,8 @@ import numpy as np
 from pathlib import Path
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 import tensorflow as tf
-from tensorflow import keras
-from tensorflow.keras import layers
+import keras
+from keras import layers
 import pickle
 from typing import List, Optional, Tuple
 from glob import glob
@@ -26,6 +27,34 @@ if gpus:
 # For CPU: limit the number of threads to prevent overallocation
 tf.config.threading.set_intra_op_parallelism_threads(4)
 tf.config.threading.set_inter_op_parallelism_threads(2)
+
+
+def _fill_unknown(y_true, y_pred):
+    """
+    Replace missing (NaN) targets with the prediction, so they add no error and no
+    gradient. Windows near a trip's end have no target for stops past it.
+    """
+    known = keras.ops.logical_not(keras.ops.isnan(y_true))
+    return keras.ops.where(known, y_true, y_pred), known
+
+
+@keras.saving.register_keras_serializable(package="astrotrain")
+def masked_huber(y_true, y_pred):
+    """
+    Huber loss over known targets. Huber is squared error for small misses and
+    linear past 1 std, so the rare real delays of 10+ minutes don't dominate.
+    """
+    y_true, _ = _fill_unknown(y_true, y_pred)
+    return keras.losses.huber(y_true, y_pred, delta=1.0)
+
+
+@keras.saving.register_keras_serializable(package="astrotrain")
+def masked_mae(y_true, y_pred):
+    """Mean absolute error over known targets (in scaled units)"""
+    y_true, known = _fill_unknown(y_true, y_pred)
+    n_known = keras.ops.sum(keras.ops.cast(known, y_pred.dtype), axis=-1)
+    total = keras.ops.sum(keras.ops.abs(y_true - y_pred), axis=-1)
+    return total / keras.ops.maximum(n_known, 1.0)
 
 
 class CountdownClockLSTM:
@@ -52,13 +81,14 @@ class CountdownClockLSTM:
     def __init__(
         self,
         sequence_length: int = 10,
-        prediction_horizon: int = 1,
+        prediction_horizon: int = 10,
         seed: Optional[int] = None,
     ):
         """
         Args:
             sequence_length: Number of historical stops to use as input
-            prediction_horizon: How many stops ahead to predict
+            prediction_horizon: Number of stops ahead to predict arrival at; the
+                                model has one output per stop (1, 2, ... ahead)
             seed: Seed for shuffling training data (None for a different
                   order every run)
         """
@@ -72,6 +102,16 @@ class CountdownClockLSTM:
         self.stop_encoder = LabelEncoder()
         self.fill_values = {}
         self.feature_columns = []
+
+    @property
+    def target_columns(self) -> List[str]:
+        """Seconds from leaving a stop to arriving 1, 2, ... stops ahead"""
+        return [f"target_{k}" for k in range(1, self.prediction_horizon + 1)]
+
+    @property
+    def scheduled_target_columns(self) -> List[str]:
+        """The schedule's estimate of each target, for evaluating against"""
+        return [f"target_scheduled_{k}" for k in range(1, self.prediction_horizon + 1)]
 
     def load_data(self, parquet_files: List[str]) -> pd.DataFrame:
         """Load and combine multiple parquet files"""
@@ -169,6 +209,42 @@ class CountdownClockLSTM:
             # Clear memory
             del df, X, y, X_reshaped, X_scaled, y_scaled
 
+    def _add_targets(self, df: pd.DataFrame):
+        """
+        Add target_k: seconds from the train leaving each stop to arriving k stops
+        later, for k = 1 to prediction_horizon. Rows are kept even when a target
+        is unknown (past the trip's end, or a recording error on the way), so
+        trips stay intact; create_sequences skips windows with no known target.
+
+        Also adds target_scheduled_k, the schedule's estimate of the same time.
+        """
+        # Arrival-to-arrival time into each stop. A leg longer than the limit is a
+        # recording error (e.g. a train parked at a terminal), so any target that
+        # passes through one is left unknown.
+        df["arrival_leg"] = df.groupby(self.TRIP_KEY)["stop_timestamp"].diff()
+        trips = df.groupby(self.TRIP_KEY)
+
+        # The train leaves when it starts moving to the next stop, or, if that
+        # wasn't recorded, after its dwell here
+        departure = trips["move_timestamp"].shift(-1)
+        departure = departure.fillna(df["stop_timestamp"] + df["dwell_time_seconds"])
+        dwell_done = departure - df["stop_timestamp"]
+
+        broken = pd.Series(False, index=df.index)
+        scheduled = pd.Series(0.0, index=df.index)
+        for k in range(1, self.prediction_horizon + 1):
+            target = trips["stop_timestamp"].shift(-k) - departure
+            if k == 1:
+                broken = target > self.MAX_TRAVEL_TIME_SECONDS
+            else:
+                broken |= trips["arrival_leg"].shift(-k) > self.MAX_TRAVEL_TIME_SECONDS
+            df[f"target_{k}"] = target.where(~broken & (target > 0))
+
+            # Scheduled times run arrival to arrival, so the schedule's estimate
+            # from departure is the sum of the legs minus the dwell already done
+            scheduled = scheduled + trips["scheduled_travel_time"].shift(-k)
+            df[f"target_scheduled_{k}"] = scheduled - dwell_done
+
     def preprocess_data(self, df: pd.DataFrame) -> pd.DataFrame:
         """Clean and prepare data for modeling"""
         if not self.fill_values:
@@ -179,27 +255,12 @@ class CountdownClockLSTM:
         # Sort by trip and stop sequence
         df = df.sort_values([*self.TRIP_KEY, "stop_sequence"]).reset_index(drop=True)
 
+        self._add_targets(df)
+
         # Treat impossible travel times as missing
         df["travel_time_seconds"] = df["travel_time_seconds"].where(
             df["travel_time_seconds"] <= self.MAX_TRAVEL_TIME_SECONDS
         )
-
-        # Create target variable: time until arrival (for countdown clock)
-        # We'll predict travel_time_seconds to the next stop. Rows are kept even
-        # when that's unknown, so trips stay intact; create_sequences skips them.
-        df["target_travel_time"] = df.groupby(self.TRIP_KEY)[
-            "travel_time_seconds"
-        ].shift(-self.prediction_horizon)
-
-        # The schedule's estimate for the same target, for evaluating against.
-        # Scheduled times run arrival to arrival, so they include the dwell at
-        # the previous stop that travel_time_seconds leaves out; subtract it.
-        df["scheduled_running_time"] = df["scheduled_travel_time"] - df.groupby(
-            self.TRIP_KEY
-        )["dwell_time_seconds"].shift(1)
-        df["target_scheduled_travel_time"] = df.groupby(self.TRIP_KEY)[
-            "scheduled_running_time"
-        ].shift(-self.prediction_horizon)
 
         # Flag missing travel times (usually the first stop, plus recording gaps)
         # and fill them with the scheduled time, or 0 when there isn't one
@@ -265,20 +326,20 @@ class CountdownClockLSTM:
                 continue
 
             trip_features = trip_df[self.feature_columns].values
-            trip_targets = trip_df["target_travel_time"].values
+            trip_targets = trip_df[self.target_columns].values
 
             # Create sliding windows over consecutive stops, ending on each stop
-            # whose next travel time is known
+            # with at least one known target
             for i in range(len(trip_df) - self.sequence_length + 1):
-                target = trip_targets[i + self.sequence_length - 1]
-                if np.isnan(target):
+                targets = trip_targets[i + self.sequence_length - 1]
+                if np.isnan(targets).all():
                     continue
                 X_sequences.append(trip_features[i : i + self.sequence_length])
-                y_targets.append(target)
+                y_targets.append(targets)
                 end_rows.append(trip_df.index[i + self.sequence_length - 1])
 
         X = np.array(X_sequences)
-        y = np.array(y_targets).reshape(-1, 1)
+        y = np.array(y_targets).reshape(-1, self.prediction_horizon)
 
         print(f"Created {len(X)} sequences of shape {X.shape}")
         if return_index:
@@ -303,17 +364,15 @@ class CountdownClockLSTM:
                 layers.Dense(32, activation="relu"),
                 layers.Dropout(0.2),
                 layers.Dense(16, activation="relu"),
-                # Output layer (predicting travel time in seconds)
-                layers.Dense(1, activation="linear"),
+                # Output layer: time to arrive at each of the next stops
+                layers.Dense(self.prediction_horizon, activation="linear"),
             ]
         )
 
         model.compile(
             optimizer=keras.optimizers.Adam(learning_rate=0.001),
-            # Huber is squared error for small misses and linear past 1 std, so
-            # the rare real delays of 10+ minutes don't dominate training
-            loss=keras.losses.Huber(delta=1.0),
-            metrics=["mae", "mse"],
+            loss=masked_huber,
+            metrics=[masked_mae],
         )
 
         self.model = model
@@ -346,6 +405,14 @@ class CountdownClockLSTM:
         self.fit_fill_values(df_sample)
         df_sample = self.preprocess_data(df_sample)
         X_sample, y_sample = self.create_sequences(df_sample)
+
+        # A horizon no sample trip reaches can't be scaled or learned
+        never_known = np.isnan(y_sample).all(axis=0)
+        if never_known.any():
+            raise ValueError(
+                f"No trips in the sample reach {np.argmax(never_known) + 1} stops "
+                f"ahead; lower prediction_horizon (now {self.prediction_horizon})"
+            )
 
         # Fit scalers
         n_samples, n_timesteps, n_features = X_sample.shape
@@ -390,7 +457,7 @@ class CountdownClockLSTM:
         # restarted every epoch and each epoch is one full pass over the files.
         output_signature = (
             tf.TensorSpec(shape=(None, n_timesteps, n_features), dtype=tf.float32),
-            tf.TensorSpec(shape=(None, 1), dtype=tf.float32),
+            tf.TensorSpec(shape=(None, self.prediction_horizon), dtype=tf.float32),
         )
         train_dataset = tf.data.Dataset.from_generator(
             lambda: self.sequence_generator(
@@ -490,7 +557,7 @@ if __name__ == "__main__":
     print(f"Found {len(parquet_files)} parquet files")
 
     # Initialize model
-    lstm = CountdownClockLSTM(sequence_length=10, prediction_horizon=1)
+    lstm = CountdownClockLSTM(sequence_length=10, prediction_horizon=10)
 
     # Train with file batching
     # Adjust file_batch_size based on your RAM
