@@ -12,6 +12,8 @@ from sklearn.preprocessing import StandardScaler, LabelEncoder
 import tensorflow as tf
 import keras
 from keras import layers
+
+from astrotrain.network import add_train_ahead
 import pickle
 from typing import List, Optional, Tuple
 from glob import glob
@@ -277,6 +279,7 @@ class CountdownClockLSTM:
         # wasn't recorded, after its dwell here
         departure = trips["move_timestamp"].shift(-1)
         departure = departure.fillna(df["stop_timestamp"] + df["dwell_time_seconds"])
+        df["departure_time"] = departure
         dwell_done = departure - df["stop_timestamp"]
 
         broken = pd.Series(False, index=df.index)
@@ -333,6 +336,7 @@ class CountdownClockLSTM:
         self._add_targets(df)
         self._add_departure_hour(df)
         self._add_typical_times(df)
+        add_train_ahead(df, self.TRIP_KEY, self.typical_time_columns)
 
         # Treat impossible travel times as missing
         df["travel_time_seconds"] = df["travel_time_seconds"].where(
