@@ -11,7 +11,10 @@ def _preload_cusolver():
     library by its full path first means TensorFlow's later load by name finds it
     already loaded. Does nothing without the `gpu` extra.
     """
-    spec = importlib.util.find_spec("nvidia.cusolver")
+    try:
+        spec = importlib.util.find_spec("nvidia.cusolver")
+    except ModuleNotFoundError:  # no `nvidia` package at all
+        return
     if spec is None or not spec.submodule_search_locations:
         return
     library = Path(spec.submodule_search_locations[0]) / "lib" / "libcusolver.so.11"
