@@ -29,8 +29,6 @@ def lamp_frame(
                     "stop_sequence": seq,
                     "parent_station": station,
                     "route_id": route_id,
-                    # Only the Red Line has branches (Red-A, Red-B)
-                    "branch_route_id": None,
                     "direction_id": trip % 2 == 0,
                     "start_time": 6 * 3600 + trip * 600,
                     "stop_count": len(stop_names),

@@ -102,7 +102,6 @@ class CountdownClockLSTM:
         self.feature_scaler = StandardScaler()
         self.target_scaler = StandardScaler()
         self.route_encoder = LabelEncoder()
-        self.branch_encoder = LabelEncoder()
         self.stop_encoder = LabelEncoder()
         self.fill_values = {}
         self.feature_columns = []
@@ -111,11 +110,6 @@ class CountdownClockLSTM:
     def target_columns(self) -> List[str]:
         """Seconds from leaving a stop to arriving 1, 2, ... stops ahead"""
         return [f"target_{k}" for k in range(1, self.prediction_horizon + 1)]
-
-    @property
-    def upcoming_schedule_columns(self) -> List[str]:
-        """Scheduled time of each leg ahead, an input known at prediction time"""
-        return [f"scheduled_leg_{k}" for k in range(1, self.prediction_horizon + 1)]
 
     @property
     def scheduled_target_columns(self) -> List[str]:
@@ -136,33 +130,18 @@ class CountdownClockLSTM:
 
     def fit_encoders(self, parquet_files: List[str]):
         """
-        Fit categorical encoders on every route, branch and station across all
-        files, so each one maps to the same code in every file batch.
+        Fit categorical encoders on every route and station across all files,
+        so each one maps to the same code in every file batch.
         """
-        routes, branches, stations = set(), set(), set()
+        routes, stations = set(), set()
         for file_path in parquet_files:
-            df = pd.read_parquet(
-                file_path, columns=["route_id", "branch_route_id", "parent_station"]
-            )
+            df = pd.read_parquet(file_path, columns=["route_id", "parent_station"])
             routes.update(df["route_id"].unique())
-            branches.update(self._branch(df).unique())
             stations.update(df["parent_station"].unique())
 
         self.route_encoder.fit(list(routes))
-        self.branch_encoder.fit(list(branches))
         self.stop_encoder.fit(list(stations))
-        print(
-            f"Encoded {len(routes)} routes, {len(branches)} branches and "
-            f"{len(stations)} stations"
-        )
-
-    @staticmethod
-    def _branch(df: pd.DataFrame) -> pd.Series:
-        """
-        The branch a trip runs on: Red-A (Ashmont) or Red-B (Braintree) for the
-        Red Line, which shares one route_id, and the route itself elsewhere
-        """
-        return df["branch_route_id"].fillna(df["route_id"])
+        print(f"Encoded {len(routes)} routes and {len(stations)} stations")
 
     def fit_fill_values(self, df: pd.DataFrame):
         """
@@ -269,20 +248,6 @@ class CountdownClockLSTM:
             scheduled = scheduled + trips["scheduled_travel_time"].shift(-k)
             df[f"target_scheduled_{k}"] = scheduled - dwell_done
 
-    def _add_upcoming_schedule(self, df: pd.DataFrame):
-        """
-        Add what the timetable says about the stops ahead, which is known when
-        the train leaves a stop: stops_remaining in the trip, and scheduled_leg_k,
-        the scheduled arrival-to-arrival time into the stop k ahead (the training
-        median if missing, 0 past the end of the trip).
-        """
-        trips = df.groupby(self.TRIP_KEY)
-        df["stops_remaining"] = trips.cumcount(ascending=False)
-        median = self.fill_values["scheduled_travel_time"]
-        for k, column in enumerate(self.upcoming_schedule_columns, start=1):
-            leg = trips["scheduled_travel_time"].shift(-k).fillna(median)
-            df[column] = leg.where(df["stops_remaining"] >= k, 0.0)
-
     def preprocess_data(self, df: pd.DataFrame) -> pd.DataFrame:
         """Clean and prepare data for modeling"""
         if not self.fill_values:
@@ -294,7 +259,6 @@ class CountdownClockLSTM:
         df = df.sort_values([*self.TRIP_KEY, "stop_sequence"]).reset_index(drop=True)
 
         self._add_targets(df)
-        self._add_upcoming_schedule(df)
 
         # Treat impossible travel times as missing
         df["travel_time_seconds"] = df["travel_time_seconds"].where(
@@ -313,7 +277,6 @@ class CountdownClockLSTM:
 
         # Encode categorical variables (encoders are fit once in fit_encoders)
         df["route_encoded"] = self.route_encoder.transform(df["route_id"])
-        df["branch_encoded"] = self.branch_encoder.transform(self._branch(df))
         df["stop_encoded"] = self.stop_encoder.transform(df["parent_station"])
 
         # Create time-based features
@@ -349,14 +312,11 @@ class CountdownClockLSTM:
             "scheduled_travel_time",
             "scheduled_headway_trunk",
             "route_encoded",
-            "branch_encoded",
             "stop_encoded",
             "hour_of_day",
             "day_of_week",
             "direction_binary",
             "stop_count",
-            "stops_remaining",
-            *self.upcoming_schedule_columns,
         ]
 
         length = self.sequence_length
@@ -564,7 +524,6 @@ class CountdownClockLSTM:
                     "feature_scaler": self.feature_scaler,
                     "target_scaler": self.target_scaler,
                     "route_encoder": self.route_encoder,
-                    "branch_encoder": self.branch_encoder,
                     "stop_encoder": self.stop_encoder,
                     "fill_values": self.fill_values,
                     "feature_columns": self.feature_columns,
@@ -587,7 +546,6 @@ class CountdownClockLSTM:
             self.feature_scaler = saved_objects["feature_scaler"]
             self.target_scaler = saved_objects["target_scaler"]
             self.route_encoder = saved_objects["route_encoder"]
-            self.branch_encoder = saved_objects["branch_encoder"]
             self.stop_encoder = saved_objects["stop_encoder"]
             self.fill_values = saved_objects["fill_values"]
             self.feature_columns = saved_objects["feature_columns"]
