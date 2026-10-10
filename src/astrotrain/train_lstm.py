@@ -31,6 +31,10 @@ tf.config.threading.set_inter_op_parallelism_threads(2)
 class CountdownClockLSTM:
     """LSTM model for predicting MBTA countdown clock times"""
 
+    # Identifies one run of a trip. Scheduled trip IDs repeat on every day with the
+    # same timetable, and some Green Line trips appear under two branches.
+    TRIP_KEY = ["service_date", "route_id", "trip_id"]
+
     def __init__(self, sequence_length: int = 10, prediction_horizon: int = 1):
         """
         Args:
@@ -124,13 +128,13 @@ class CountdownClockLSTM:
     def preprocess_data(self, df: pd.DataFrame) -> pd.DataFrame:
         """Clean and prepare data for modeling"""
         # Sort by trip and stop sequence
-        df = df.sort_values(["trip_id", "stop_sequence"]).reset_index(drop=True)
+        df = df.sort_values([*self.TRIP_KEY, "stop_sequence"]).reset_index(drop=True)
 
         # Create target variable: time until arrival (for countdown clock)
         # We'll predict travel_time_seconds to the next stop
-        df["target_travel_time"] = df.groupby("trip_id")["travel_time_seconds"].shift(
-            -self.prediction_horizon
-        )
+        df["target_travel_time"] = df.groupby(self.TRIP_KEY)[
+            "travel_time_seconds"
+        ].shift(-self.prediction_horizon)
 
         # Remove rows without target
         df = df.dropna(subset=["target_travel_time"])
@@ -188,7 +192,7 @@ class CountdownClockLSTM:
         y_targets = []
 
         # Group by trip to maintain temporal continuity
-        for trip_id, trip_df in df.groupby("trip_id"):
+        for _, trip_df in df.groupby(self.TRIP_KEY):
             if len(trip_df) < self.sequence_length + 1:
                 continue
 

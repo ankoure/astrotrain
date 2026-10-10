@@ -53,6 +53,36 @@ def test_target_is_next_stops_travel_time_within_each_trip(lstm):
     assert targets.tolist() == [[20.0, 30.0], [21.0, 31.0]]
 
 
+@pytest.mark.parametrize(
+    ("column", "values"),
+    [("service_date", [20250901, 20250902]), ("route_id", ["Red", "Green-B"])],
+    ids=["different-days", "different-routes"],
+)
+def test_trips_sharing_an_id_stay_separate(lstm, column, values):
+    # Regression: real trip IDs repeat across days with the same timetable, and
+    # some Green Line trips share an ID across branches. Grouping by trip_id
+    # alone interleaved their stops.
+    first = lamp_frame(20250901, "Red", stations(0, 5), n_trips=1)
+    second = first.copy()
+    first[column], second[column] = values
+    first["travel_time_seconds"] = [10.0, 20.0, 30.0, 40.0, 50.0]
+    second["travel_time_seconds"] = [11.0, 21.0, 31.0, 41.0, 51.0]
+
+    out = lstm.preprocess_data(pd.concat([first, second]))
+    X, _ = lstm.create_sequences(out)
+
+    targets = out.groupby(column)["target_travel_time"].apply(list).to_dict()
+    assert targets == {
+        values[0]: [20.0, 30.0, 40.0, 50.0],
+        values[1]: [21.0, 31.0, 41.0, 51.0],
+    }
+    # The first trip's times end in 0 and the second's in 1, so a window
+    # drawn from a single trip has only one remainder
+    travel_time = X[:, :, lstm.feature_columns.index("travel_time_seconds")]
+    assert len(X) > 0
+    assert all(len(set(window % 10)) == 1 for window in travel_time)
+
+
 def test_missing_values_filled_with_median(lstm):
     df = lamp_frame(20250901, "Red", stations(0, 4), n_trips=1)
     df["dwell_time_seconds"] = [10.0, np.nan, 30.0, 50.0]
