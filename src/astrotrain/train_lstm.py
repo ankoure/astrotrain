@@ -58,6 +58,21 @@ class CountdownClockLSTM:
         print(f"Total records: {len(combined_df)}")
         return combined_df
 
+    def fit_encoders(self, parquet_files: List[str]):
+        """
+        Fit categorical encoders on every route and station across all files,
+        so each one maps to the same code in every file batch.
+        """
+        routes, stations = set(), set()
+        for file_path in parquet_files:
+            df = pd.read_parquet(file_path, columns=["route_id", "parent_station"])
+            routes.update(df["route_id"].unique())
+            stations.update(df["parent_station"].unique())
+
+        self.route_encoder.fit(list(routes))
+        self.stop_encoder.fit(list(stations))
+        print(f"Encoded {len(routes)} routes and {len(stations)} stations")
+
     def sequence_generator(self, parquet_files: List[str], file_batch_size: int = 5,
                            mini_batch_size: int = 64):
         """
@@ -89,9 +104,10 @@ class CountdownClockLSTM:
             X_reshaped = X.reshape(-1, n_features)
             X_scaled = self.feature_scaler.transform(X_reshaped)
             X_scaled = X_scaled.reshape(n_samples, n_timesteps, n_features)
+            X_scaled = X_scaled.astype(np.float32)
 
             # Scale targets
-            y_scaled = self.target_scaler.transform(y)
+            y_scaled = self.target_scaler.transform(y).astype(np.float32)
 
             # Yield mini-batches from this data
             for j in range(0, n_samples, mini_batch_size):
@@ -130,9 +146,9 @@ class CountdownClockLSTM:
             if col in df.columns:
                 df[col] = df[col].fillna(df[col].median())
 
-        # Encode categorical variables
-        df["route_encoded"] = self.route_encoder.fit_transform(df["route_id"])
-        df["stop_encoded"] = self.stop_encoder.fit_transform(df["parent_station"])
+        # Encode categorical variables (encoders are fit once in fit_encoders)
+        df["route_encoded"] = self.route_encoder.transform(df["route_id"])
+        df["stop_encoded"] = self.stop_encoder.transform(df["parent_station"])
 
         # Create time-based features
         df["hour_of_day"] = (df["start_time"] // 3600) % 24
@@ -235,8 +251,11 @@ class CountdownClockLSTM:
             file_batch_size: Number of parquet files to load at once
                            (adjust based on RAM)
         """
-        # First pass: fit scalers and encoders on a sample of data
-        print("Fitting preprocessors on initial data sample...")
+        # Fit encoders on all files, then scalers on a sample of data
+        print("Fitting encoders on all files...")
+        self.fit_encoders(parquet_files)
+
+        print("Fitting scalers on initial data sample...")
         sample_files = parquet_files[: min(10, len(parquet_files))]
         df_sample = self.load_data(sample_files)
         df_sample = self.preprocess_data(df_sample)
@@ -281,30 +300,26 @@ class CountdownClockLSTM:
             f"validating on {len(val_files)} files"
         )
 
-        # Create data generators
-        train_generator = self.sequence_generator(
-            train_files, file_batch_size, batch_size)
-        val_generator = self.sequence_generator(
-            val_files, file_batch_size, batch_size)
-
-        # Estimate steps per epoch (more accurate approximation)
-        # Each file batch might contain ~10-50k sequences, with mini_batch_size
-        avg_sequences_per_file_batch = 20000  # Conservative estimate
-        train_sequences = (len(train_files) * avg_sequences_per_file_batch
-                           // file_batch_size)
-        val_sequences = (len(val_files) * avg_sequences_per_file_batch
-                         // file_batch_size)
-
-        steps_per_epoch = max(10, train_sequences // batch_size)
-        validation_steps = max(5, val_sequences // batch_size)
+        # Create datasets. from_generator takes a callable, so the generator is
+        # restarted every epoch and each epoch is one full pass over the files.
+        output_signature = (
+            tf.TensorSpec(shape=(None, n_timesteps, n_features), dtype=tf.float32),
+            tf.TensorSpec(shape=(None, 1), dtype=tf.float32),
+        )
+        train_dataset = tf.data.Dataset.from_generator(
+            lambda: self.sequence_generator(train_files, file_batch_size, batch_size),
+            output_signature=output_signature,
+        )
+        val_dataset = tf.data.Dataset.from_generator(
+            lambda: self.sequence_generator(val_files, file_batch_size, batch_size),
+            output_signature=output_signature,
+        )
 
         # Train using fit with callbacks
         history = self.model.fit(
-            train_generator,
-            steps_per_epoch=steps_per_epoch,
+            train_dataset,
             epochs=epochs,
-            validation_data=val_generator,
-            validation_steps=validation_steps,
+            validation_data=val_dataset,
             callbacks=[early_stopping, reduce_lr, model_checkpoint],
             verbose=1
         )

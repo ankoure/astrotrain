@@ -2,6 +2,7 @@ import pandas as pd
 from pathlib import Path
 from datetime import datetime
 import logging
+import shutil
 import urllib.request
 
 # Configure logging
@@ -39,27 +40,25 @@ def download_index_csv():
 
     try:
         logger.info(f"Downloading MBTA data from: {url}")
-
-        logger.info(f"Successfully downloaded data to: {filepath}")
         urllib.request.urlretrieve(url, filepath)
-        logger.info(f"Also saved as latest version: {latest_filepath}")
-        urllib.request.urlretrieve(url, latest_filepath)
+        logger.info(f"Successfully downloaded data to: {filepath}")
 
         # Validate the downloaded data
         try:
             df = pd.read_csv(filepath)
             logger.info(f"Data validation successful. Shape: {df.shape}")
             logger.info(f"Columns: {list(df.columns)}")
-            return filepath
 
         except Exception as e:
             logger.error(f"Data validation failed: {e}")
-            # Remove invalid file
+            # Remove invalid file, leaving any previous latest version intact
             if filepath.exists():
                 filepath.unlink()
-            if latest_filepath.exists():
-                latest_filepath.unlink()
             raise
+
+        shutil.copyfile(filepath, latest_filepath)
+        logger.info(f"Also saved as latest version: {latest_filepath}")
+        return filepath
 
     except Exception as e:
         logger.error(f"Unexpected error during download: {e}")
