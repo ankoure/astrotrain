@@ -187,6 +187,56 @@ def test_day_of_week(lstm):
     assert set(out["day_of_week"]) == {5}  # 2025-09-06 is a Saturday
 
 
+def test_upcoming_schedule_is_the_scheduled_legs_ahead(lstm3):
+    df = lamp_frame(20250901, "Red", stations(0, 5), n_trips=1)
+    df["scheduled_travel_time"] = [100.0, 110.0, 130.0, 140.0, 150.0]
+
+    out = lstm3.preprocess_data(with_timestamps(df))
+
+    legs = out[lstm3.upcoming_schedule_columns]
+    assert legs.loc[0].tolist() == [110.0, 130.0, 140.0]
+    # Past the end of the trip there's no leg
+    assert legs.loc[3].tolist() == [150.0, 0.0, 0.0]
+    assert legs.loc[4].tolist() == [0.0, 0.0, 0.0]
+    assert out["stops_remaining"].tolist() == [4, 3, 2, 1, 0]
+
+
+def test_missing_upcoming_schedule_uses_the_training_median(lstm3):
+    df = lamp_frame(20250901, "Red", stations(0, 5), n_trips=1)
+    df["scheduled_travel_time"] = [100.0, 110.0, np.nan, 140.0, 150.0]
+
+    out = lstm3.preprocess_data(with_timestamps(df))
+
+    # The synthetic training files all schedule 120s legs
+    assert lstm3.fill_values["scheduled_travel_time"] == 120.0
+    assert out.loc[0, lstm3.upcoming_schedule_columns].tolist() == [110.0, 120.0, 140.0]
+
+
+def test_red_line_branches_get_their_own_codes(lstm, tmp_path):
+    # Ashmont (Red-A) and Braintree (Red-B) trains share route_id "Red"
+    files = []
+    for branch in ["Red-A", "Red-B"]:
+        df = lamp_frame(20250901, "Red", stations(0, 3), n_trips=1)
+        df["branch_route_id"] = branch
+        df["trip_id"] = branch
+        files.append(tmp_path / f"{branch}.parquet")
+        df.to_parquet(files[-1])
+    orange = lamp_frame(20250901, "Orange", stations(0, 3), n_trips=1)
+    files.append(tmp_path / "orange.parquet")
+    orange.to_parquet(files[-1])
+    lstm.fit_encoders(files)
+
+    out = lstm.preprocess_data(
+        pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
+    )
+
+    codes = out.groupby("trip_id")["branch_encoded"].first()
+    assert codes["Red-A"] != codes["Red-B"]
+    # Lines without branches use their route
+    assert out.loc[out["route_id"] == "Orange", "branch_encoded"].nunique() == 1
+    assert set(lstm.branch_encoder.classes_) == {"Red-A", "Red-B", "Orange"}
+
+
 # --- create_sequences ---
 
 
@@ -545,4 +595,5 @@ def test_save_and_load_round_trip(lstm3, parquet_files, tmp_path):
     assert loaded.sequence_length == lstm3.sequence_length
     assert loaded.feature_columns == lstm3.feature_columns
     assert list(loaded.stop_encoder.classes_) == list(lstm3.stop_encoder.classes_)
+    assert list(loaded.branch_encoder.classes_) == list(lstm3.branch_encoder.classes_)
     assert loaded.fill_values == lstm3.fill_values
