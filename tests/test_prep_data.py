@@ -139,3 +139,32 @@ def test_failed_download_leaves_no_partial_file_and_others_continue(
         parquet_name("2025-09-01"),
         parquet_name("2025-09-03"),
     ]
+
+
+ACCURACY_CSV = (
+    "weekly,mode,route_id,bin,arrival_departure,num_predictions,"
+    "num_accurate_predictions\n"
+    "2026-09-04,subway,Red,0-3 min,blended,1000,840\n"
+)
+
+
+def test_download_prediction_accuracy(tmp_path, fake_download):
+    fake_download.content = ACCURACY_CSV
+
+    path = prep_data.download_prediction_accuracy(data_dir=tmp_path)
+
+    assert path == tmp_path / "mbta_prediction_accuracy.csv"
+    assert path.read_text() == ACCURACY_CSV
+    assert fake_download.calls[0][0] == prep_data.PREDICTION_ACCURACY_URL
+
+
+def test_bad_prediction_accuracy_download_keeps_previous_copy(tmp_path, fake_download):
+    fake_download.content = ACCURACY_CSV
+    prep_data.download_prediction_accuracy(data_dir=tmp_path)
+    fake_download.content = "weekly,mode\n2026-09-11,subway\n"  # columns missing
+
+    with pytest.raises(ValueError, match="missing"):
+        prep_data.download_prediction_accuracy(data_dir=tmp_path)
+
+    assert [p.name for p in tmp_path.iterdir()] == ["mbta_prediction_accuracy.csv"]
+    assert (tmp_path / "mbta_prediction_accuracy.csv").read_text() == ACCURACY_CSV

@@ -111,6 +111,46 @@ def download_parquet_files(
     return downloaded
 
 
+# The MBTA's weekly Rapid Transit and Bus Prediction Accuracy Data, from the
+# MassDOT/MBTA open data portal (mbta-massdot.opendata.arcgis.com)
+PREDICTION_ACCURACY_URL = (
+    "https://www.arcgis.com/sharing/rest/content/items/"
+    "155ab68df00145cabddfb90377201b0e/data"
+)
+PREDICTION_ACCURACY_COLUMNS = {
+    "weekly",
+    "mode",
+    "route_id",
+    "bin",
+    "arrival_departure",
+    "num_predictions",
+    "num_accurate_predictions",
+}
+
+
+def download_prediction_accuracy(data_dir: Path = DATA_DIR) -> Path:
+    """
+    Download how accurate the MBTA's own arrival predictions were each week, by
+    line and how far ahead, to compare our model against (evaluate.py
+    --mbta-accuracy). The previous copy is kept if the download isn't valid.
+    """
+    data_dir.mkdir(exist_ok=True)
+    path = data_dir / "mbta_prediction_accuracy.csv"
+    partial = path.with_name(path.name + ".part")
+    urllib.request.urlretrieve(PREDICTION_ACCURACY_URL, partial)
+    try:
+        df = pd.read_csv(partial)
+        missing = PREDICTION_ACCURACY_COLUMNS - set(df.columns)
+        if missing:
+            raise ValueError(f"Prediction accuracy data is missing {sorted(missing)}")
+    except Exception:
+        partial.unlink(missing_ok=True)
+        raise
+    partial.replace(path)
+    logger.info(f"Prediction accuracy through week {df['weekly'].max()}: {path}")
+    return path
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Download MBTA LAMP subway on-time performance data into data/"
@@ -135,6 +175,7 @@ def main():
 
     download_index_csv()
     download_parquet_files(args.start, args.end, args.days)
+    download_prediction_accuracy()
 
 
 if __name__ == "__main__":

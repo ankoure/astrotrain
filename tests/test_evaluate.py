@@ -4,7 +4,14 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from astrotrain.evaluate import evaluate, main, summarize
+from astrotrain.evaluate import (
+    evaluate,
+    main,
+    mbta_comparison,
+    mbta_weeks,
+    score_like_mbta,
+    summarize,
+)
 from tests.lamp_data import lamp_frame, stations, with_timestamps
 
 
@@ -92,3 +99,128 @@ def test_main_prints_summaries_for_a_saved_model(
     assert "Compared 48 of 48 targets" in out
     assert "stops_ahead" in out
     assert "route_id" in out
+
+
+# --- scoring like the MBTA ---
+
+
+@pytest.mark.parametrize(
+    ("predicted", "actual", "group", "accurate"),
+    [
+        (120, 180, "0-3 min", True),  # 60s late is the limit
+        (120, 181, "0-3 min", False),
+        (120, 60, "0-3 min", True),  # 60s early is the limit
+        (120, 59, "0-3 min", False),
+        (180, 300, "3-6 min", True),  # 3 minutes ahead starts the next group
+        (300, 421, "3-6 min", False),  # 121s late
+        (300, 210, "3-6 min", True),  # 90s early
+        (600, 810, "6-12 min", True),  # 210s late
+        (600, 449, "6-12 min", False),  # 151s early
+        (1000, 1360, "12-30 min", True),  # 360s late
+        (1000, 760, "12-30 min", True),  # 240s early
+        (1000, 759, "12-30 min", False),
+    ],
+)
+def test_score_like_mbta_uses_each_groups_window(predicted, actual, group, accurate):
+    results = pd.DataFrame(
+        {
+            "service_date": [20260828],
+            "route_id": ["Red"],
+            "predicted": [float(predicted)],
+            "actual": [float(actual)],
+        }
+    )
+
+    scored = score_like_mbta(results, "predicted")
+
+    assert scored["bin"].tolist() == [group]
+    assert scored["accurate"].tolist() == [accurate]
+
+
+def test_predictions_30_minutes_or_more_ahead_are_not_scored():
+    results = pd.DataFrame(
+        {
+            "service_date": [20260828, 20260828],
+            "route_id": ["Red", "Red"],
+            "predicted": [1800.0, 2400.0],
+            "actual": [1800.0, 2400.0],
+        }
+    )
+
+    assert score_like_mbta(results, "predicted").empty
+
+
+def days(start, n):
+    first = pd.Timestamp(str(start))
+    return [int((first + pd.Timedelta(days=i)).strftime("%Y%m%d")) for i in range(n)]
+
+
+def test_mbta_weeks_are_complete_friday_to_thursday_weeks():
+    # Friday 2026-08-21 to Thursday 2026-09-03, labeled the following Fridays
+    two_weeks = days(20260821, 14)
+    assert mbta_weeks(two_weeks) == ["2026-08-28", "2026-09-04"]
+
+    missing_a_day = [d for d in two_weeks if d != 20260825]
+    assert mbta_weeks(missing_a_day) == ["2026-09-04"]
+
+
+def test_mbta_comparison_lines_up_our_accuracy_with_theirs():
+    week = days(20260828, 7)  # the week labeled 2026-09-04
+    rows = [
+        # 0-3 min: 3 of 4 accurate for us, 2 of 4 for the schedule. Each is
+        # grouped by its own prediction, so the schedule's misses are kept under
+        # 3 minutes ahead too.
+        (week[0], 120.0, 130.0, 130.0),
+        (week[1], 120.0, 130.0, 10.0),
+        (week[2], 120.0, 130.0, 130.0),
+        (week[3], 120.0, 300.0, 10.0),
+        # 12-30 min: 1 of 2 accurate
+        (week[4], 1000.0, 1000.0, 1000.0),
+        (week[5], 1000.0, 2000.0, 2000.0),
+        # Only there so every day of the week is covered; over 30 min, not scored
+        (week[6], 3000.0, 3000.0, 3000.0),
+        # A day outside the week, which shouldn't count
+        (20260827, 120.0, 900.0, 900.0),
+    ]
+    results = pd.DataFrame(
+        rows, columns=["service_date", "predicted", "actual", "scheduled"]
+    ).assign(route_id="Red")
+    mbta = pd.DataFrame(
+        {
+            "weekly": ["2026-09-04", "2026-09-04", "2026-08-28", "2026-09-04"],
+            "mode": ["subway", "subway", "subway", "bus"],
+            "route_id": ["Red", "Red", "Red", np.nan],
+            "bin": ["0-3 min", "12-30 min", "0-3 min", "0-3 min"],
+            "arrival_departure": ["blended"] * 3 + ["departure"],
+            "num_predictions": [100, 100, 100, 100],
+            "num_accurate_predictions": [80, 70, 10, 10],
+        }
+    )
+
+    table = mbta_comparison(results, mbta)
+
+    assert table.loc[("Red", "0-3 min"), ["ours", "mbta", "schedule"]].tolist() == [
+        75.0,
+        80.0,
+        50.0,
+    ]
+    assert table.loc[("Red", "12-30 min"), ["ours", "mbta"]].tolist() == [50.0, 70.0]
+    # "all" weights each group by the MBTA's count of predictions in it
+    assert table.loc[("Red", "all"), ["ours", "mbta"]].tolist() == [62.5, 75.0]
+    assert table.loc[("Red", "all"), "ours_minus_mbta"] == -12.5
+    assert table.loc[("Red", "all"), "our_predictions"] == 6
+
+
+def test_mbta_comparison_needs_a_complete_week():
+    results = pd.DataFrame(
+        {
+            "service_date": days(20260828, 3),
+            "route_id": "Red",
+            "predicted": 120.0,
+            "actual": 120.0,
+            "scheduled": 120.0,
+        }
+    )
+
+    with pytest.raises(ValueError, match="No complete MBTA week"):
+        mbta_comparison(results, pd.DataFrame())
