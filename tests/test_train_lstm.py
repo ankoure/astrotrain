@@ -225,6 +225,17 @@ def test_window_count_per_trip(lstm, n_stops, n_windows):
     assert len(X) == len(y) == n_windows
 
 
+def test_return_index_points_at_each_windows_last_row(lstm):
+    df = lstm.preprocess_data(lamp_frame(20250901, "Red", stations(0, 8), n_trips=2))
+
+    X, y, end_rows = lstm.create_sequences(df, return_index=True)
+
+    last_stops = X[:, -1, lstm.feature_columns.index("stop_sequence")]
+    assert len(end_rows) == len(X) == len(y)
+    assert df.loc[end_rows, "stop_sequence"].tolist() == last_stops.tolist()
+    assert df.loc[end_rows, "target_travel_time"].tolist() == y.ravel().tolist()
+
+
 def test_windows_never_span_two_trips(lstm):
     df = lstm.preprocess_data(lamp_frame(20250901, "Red", stations(0, 8), n_trips=3))
 

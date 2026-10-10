@@ -191,6 +191,16 @@ class CountdownClockLSTM:
             "travel_time_seconds"
         ].shift(-self.prediction_horizon)
 
+        # The schedule's estimate for the same target, for evaluating against.
+        # Scheduled times run arrival to arrival, so they include the dwell at
+        # the previous stop that travel_time_seconds leaves out; subtract it.
+        df["scheduled_running_time"] = df["scheduled_travel_time"] - df.groupby(
+            self.TRIP_KEY
+        )["dwell_time_seconds"].shift(1)
+        df["target_scheduled_travel_time"] = df.groupby(self.TRIP_KEY)[
+            "scheduled_running_time"
+        ].shift(-self.prediction_horizon)
+
         # Flag missing travel times (usually the first stop, plus recording gaps)
         # and fill them with the scheduled time, or 0 when there isn't one
         df["travel_time_missing"] = df["travel_time_seconds"].isna().astype(int)
@@ -216,8 +226,17 @@ class CountdownClockLSTM:
 
         return df
 
-    def create_sequences(self, df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
-        """Create time series sequences for LSTM"""
+    def create_sequences(
+        self, df: pd.DataFrame, return_index: bool = False
+    ) -> Tuple[np.ndarray, ...]:
+        """
+        Create time series sequences for LSTM
+
+        Args:
+            df: Output of preprocess_data
+            return_index: Also return the df index of each window's last row,
+                          to match predictions back to their trip and stop
+        """
         # Define features for the model
         self.feature_columns = [
             "stop_sequence",
@@ -238,6 +257,7 @@ class CountdownClockLSTM:
 
         X_sequences = []
         y_targets = []
+        end_rows = []
 
         # Group by trip to maintain temporal continuity
         for _, trip_df in df.groupby(self.TRIP_KEY):
@@ -255,11 +275,14 @@ class CountdownClockLSTM:
                     continue
                 X_sequences.append(trip_features[i : i + self.sequence_length])
                 y_targets.append(target)
+                end_rows.append(trip_df.index[i + self.sequence_length - 1])
 
         X = np.array(X_sequences)
         y = np.array(y_targets).reshape(-1, 1)
 
         print(f"Created {len(X)} sequences of shape {X.shape}")
+        if return_index:
+            return X, y, np.array(end_rows)
         return X, y
 
     def build_model(self, input_shape: Tuple[int, int]):

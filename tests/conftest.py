@@ -16,3 +16,14 @@ def lstm(parquet_files):
     model.fit_encoders(parquet_files)
     model.fit_fill_values(model.load_data(parquet_files))
     return model
+
+
+@pytest.fixture
+def built_lstm(lstm, parquet_files):
+    """lstm with scalers fit and an untrained model, ready to predict or save"""
+    df = lstm.preprocess_data(lstm.load_data(parquet_files))
+    X, y = lstm.create_sequences(df)
+    lstm.feature_scaler.fit(X.reshape(-1, X.shape[-1]))
+    lstm.target_scaler.fit(y)
+    lstm.build_model(input_shape=X.shape[1:])
+    return lstm
