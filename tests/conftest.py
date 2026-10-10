@@ -12,6 +12,6 @@ def parquet_files(tmp_path):
 @pytest.fixture
 def lstm(parquet_files):
     """Small model with encoders fit on every file in parquet_files"""
-    model = CountdownClockLSTM(sequence_length=3, prediction_horizon=1)
+    model = CountdownClockLSTM(sequence_length=3, prediction_horizon=1, seed=0)
     model.fit_encoders(parquet_files)
     return model

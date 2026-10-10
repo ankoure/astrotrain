@@ -11,7 +11,7 @@ import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
 import pickle
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 from glob import glob
 
 # Configure TensorFlow for better memory management
@@ -35,14 +35,22 @@ class CountdownClockLSTM:
     # same timetable, and some Green Line trips appear under two branches.
     TRIP_KEY = ["service_date", "route_id", "trip_id"]
 
-    def __init__(self, sequence_length: int = 10, prediction_horizon: int = 1):
+    def __init__(
+        self,
+        sequence_length: int = 10,
+        prediction_horizon: int = 1,
+        seed: Optional[int] = None,
+    ):
         """
         Args:
             sequence_length: Number of historical stops to use as input
             prediction_horizon: How many stops ahead to predict
+            seed: Seed for shuffling training data (None for a different
+                  order every run)
         """
         self.sequence_length = sequence_length
         self.prediction_horizon = prediction_horizon
+        self.rng = np.random.default_rng(seed)
         self.model = keras.Sequential()
         self.feature_scaler = StandardScaler()
         self.target_scaler = StandardScaler()
@@ -82,6 +90,7 @@ class CountdownClockLSTM:
         parquet_files: List[str],
         file_batch_size: int = 5,
         mini_batch_size: int = 64,
+        shuffle: bool = False,
     ):
         """
         Memory-efficient generator that yields mini-batches of sequences from files.
@@ -90,10 +99,16 @@ class CountdownClockLSTM:
             parquet_files: List of parquet file paths
             file_batch_size: Number of files to load at once
             mini_batch_size: Size of mini-batches to yield for training
+            shuffle: Shuffle the file order, and the sequences within each file
+                     batch, on every pass
 
         Yields:
             Tuple of (X_batch, y_batch) arrays of size mini_batch_size
         """
+        if shuffle:
+            order = self.rng.permutation(len(parquet_files))
+            parquet_files = [parquet_files[k] for k in order]
+
         for i in range(0, len(parquet_files), file_batch_size):
             file_batch = parquet_files[i : i + file_batch_size]
             print(
@@ -116,6 +131,11 @@ class CountdownClockLSTM:
 
             # Scale targets
             y_scaled = self.target_scaler.transform(y).astype(np.float32)
+
+            # Sequences come out grouped by trip, so mix them before batching
+            if shuffle:
+                order = self.rng.permutation(n_samples)
+                X_scaled, y_scaled = X_scaled[order], y_scaled[order]
 
             # Yield mini-batches from this data
             for j in range(0, n_samples, mini_batch_size):
@@ -316,7 +336,9 @@ class CountdownClockLSTM:
             tf.TensorSpec(shape=(None, 1), dtype=tf.float32),
         )
         train_dataset = tf.data.Dataset.from_generator(
-            lambda: self.sequence_generator(train_files, file_batch_size, batch_size),
+            lambda: self.sequence_generator(
+                train_files, file_batch_size, batch_size, shuffle=True
+            ),
             output_signature=output_signature,
         )
         val_dataset = tf.data.Dataset.from_generator(
@@ -330,6 +352,8 @@ class CountdownClockLSTM:
             epochs=epochs,
             validation_data=val_dataset,
             callbacks=[early_stopping, reduce_lr, model_checkpoint],
+            # Keras can't shuffle a generator dataset; sequence_generator does it
+            shuffle=False,
             verbose=1,
         )
 

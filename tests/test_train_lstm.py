@@ -182,6 +182,35 @@ def test_sequence_generator_yields_float32_batches_covering_all_data(
     assert sum(len(xb) for xb, _ in batches) == len(X)
 
 
+def windows(batches):
+    """Every (sequence, target) pair from the batches in order, as hashable bytes"""
+    return [(x.tobytes(), y.tobytes()) for xb, yb in batches for x, y in zip(xb, yb)]
+
+
+def test_shuffle_changes_order_each_pass_but_not_contents(lstm, parquet_files):
+    fit_scalers(lstm, parquet_files)
+
+    def one_pass(shuffle):
+        return windows(lstm.sequence_generator(parquet_files, 2, 8, shuffle=shuffle))
+
+    in_order = one_pass(shuffle=False)
+    first, second = one_pass(shuffle=True), one_pass(shuffle=True)
+
+    assert first != in_order
+    assert first != second
+    assert sorted(first) == sorted(second) == sorted(in_order)
+
+
+def test_same_seed_gives_same_shuffle(parquet_files):
+    def first_pass(seed):
+        lstm = CountdownClockLSTM(sequence_length=3, seed=seed)
+        lstm.fit_encoders(parquet_files)
+        fit_scalers(lstm, parquet_files)
+        return windows(lstm.sequence_generator(parquet_files, 2, 8, shuffle=True))
+
+    assert first_pass(seed=0) == first_pass(seed=0)
+
+
 # Keras warns once per pass while it learns the dataset's length; it's harmless
 @pytest.mark.filterwarnings("ignore:Your input ran out of data")
 def test_every_epoch_trains_on_all_files(lstm, parquet_files, tmp_path, monkeypatch):
@@ -207,7 +236,9 @@ def test_every_epoch_trains_on_all_files(lstm, parquet_files, tmp_path, monkeypa
 
     lstm.train(parquet_files, epochs=3, batch_size=8, file_batch_size=2)
 
-    train_files = parquet_files[:4]  # train() holds out the last 20% for validation
+    # train() holds out the last 20% for validation. Every file has the same number
+    # of sequences, so the batch count doesn't depend on how files get shuffled.
+    train_files = parquet_files[:4]
     expected = sum(1 for _ in lstm.sequence_generator(train_files, 2, 8))
     assert batches_per_epoch == [expected] * 3
 
