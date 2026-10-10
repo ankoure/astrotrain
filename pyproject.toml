@@ -15,6 +15,11 @@ dependencies = [
     "pandas>=2.3.3,<4.0.0",
 ]
 
+[project.optional-dependencies]
+gpu = [
+    "tensorflow[and-cuda]>=2.20.0,<3.0.0",
+]
+
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
