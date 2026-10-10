@@ -1,9 +1,11 @@
+import argparse
 import pandas as pd
 from pathlib import Path
-from datetime import datetime
+from datetime import date, datetime, timedelta
 import logging
 import shutil
 import urllib.request
+from typing import List, Optional
 
 # Configure logging
 logging.basicConfig(
@@ -63,25 +65,81 @@ def download_index_csv(data_dir: Path = DATA_DIR):
         raise
 
 
-def download_parquet_from_csv():
+def download_parquet_files(
+    start: Optional[date] = None,
+    end: Optional[date] = None,
+    days: int = 180,
+    data_dir: Path = DATA_DIR,
+) -> List[Path]:
     """
-    Downloads the Parquet data from the MBTA LAMP data source.
+    Download the daily parquet files listed in the latest index for service dates
+    from start to end, inclusive. end defaults to the newest date in the index and
+    start to `days` days before it. Files already downloaded at the size the index
+    lists are skipped, so re-running only fetches what's new or incomplete.
     """
-    filepath = r"data/mbta_subway_ontime_performance_latest.csv"
-    df = pd.read_csv(filepath)
-    files = df["file_url"].values.tolist()
-    for file in files:
-        filename = file.replace(
-            "https://performancedata.mbta.com/lamp/subway-on-time-performance-v1/",
-            "data/",
-        )
-        urllib.request.urlretrieve(file, filename)
+    index = pd.read_csv(
+        data_dir / "mbta_subway_ontime_performance_latest.csv",
+        parse_dates=["service_date"],
+    )
+    end = end or index["service_date"].max().date()
+    start = start or end - timedelta(days=days - 1)
+    wanted = index[index["service_date"].dt.date.between(start, end)]
+    logger.info(f"{len(wanted)} daily files from {start} to {end}")
+
+    downloaded, skipped, failed = [], 0, []
+    for row in wanted.itertuples():
+        path = data_dir / row.file_url.rsplit("/", 1)[-1]
+        if path.exists() and path.stat().st_size == row.size_bytes:
+            skipped += 1
+            continue
+
+        # Download under a temporary name so an interrupted download never leaves
+        # a partial .parquet file for training to pick up
+        partial = path.with_name(path.name + ".part")
+        try:
+            urllib.request.urlretrieve(row.file_url, partial)
+            partial.replace(path)
+            downloaded.append(path)
+        except Exception as e:
+            logger.error(f"Failed to download {row.file_url}: {e}")
+            partial.unlink(missing_ok=True)
+            failed.append(row.file_url)
+
+    logger.info(f"Downloaded {len(downloaded)}, skipped {skipped} already present")
+    if failed:
+        raise RuntimeError(f"{len(failed)} downloads failed: {failed}")
+    return downloaded
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Download MBTA LAMP subway on-time performance data into data/"
+    )
+    parser.add_argument(
+        "--start",
+        type=date.fromisoformat,
+        help="First service date, YYYY-MM-DD (default: --days before --end)",
+    )
+    parser.add_argument(
+        "--end",
+        type=date.fromisoformat,
+        help="Last service date, YYYY-MM-DD (default: the newest in the index)",
+    )
+    parser.add_argument(
+        "--days",
+        type=int,
+        default=180,
+        help="Days to download when --start isn't given (default: 180)",
+    )
+    args = parser.parse_args()
+
+    download_index_csv()
+    download_parquet_files(args.start, args.end, args.days)
 
 
 if __name__ == "__main__":
     try:
-        download_index_csv()
-        # download_parquet_from_csv()
+        main()
     except Exception as e:
         print(f"Error downloading MBTA data: {e}")
         exit(1)
