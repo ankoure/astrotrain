@@ -6,6 +6,7 @@ train leaves a stop, how long until it arrives at each of the next several stops
 
 import pandas as pd
 import numpy as np
+from numpy.lib.stride_tricks import sliding_window_view
 from pathlib import Path
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 import tensorflow as tf
@@ -318,34 +319,39 @@ class CountdownClockLSTM:
             "stop_count",
         ]
 
-        X_sequences = []
-        y_targets = []
-        end_rows = []
+        length = self.sequence_length
 
-        # Group by trip to maintain temporal continuity
-        for _, trip_df in df.groupby(self.TRIP_KEY):
-            if len(trip_df) < self.sequence_length:
-                continue
+        # Put each trip's rows together, trips in key order and stops in their
+        # existing order (preprocess_data already sorts this way). Rows with a
+        # missing trip key get no trip number and are left out, as groupby does.
+        trip = df.groupby(self.TRIP_KEY).ngroup().to_numpy()
+        order = np.argsort(trip, kind="stable")
+        trip = trip[order]
+        features = df[self.feature_columns].to_numpy(dtype=float)[order]
+        targets = df[self.target_columns].to_numpy(dtype=float)[order]
+        index = df.index.to_numpy()[order]
 
-            trip_features = trip_df[self.feature_columns].values
-            trip_targets = trip_df[self.target_columns].values
-
-            # Create sliding windows over consecutive stops, ending on each stop
-            # with at least one known target
-            for i in range(len(trip_df) - self.sequence_length + 1):
-                targets = trip_targets[i + self.sequence_length - 1]
-                if np.isnan(targets).all():
-                    continue
-                X_sequences.append(trip_features[i : i + self.sequence_length])
-                y_targets.append(targets)
-                end_rows.append(trip_df.index[i + self.sequence_length - 1])
-
-        X = np.array(X_sequences)
-        y = np.array(y_targets).reshape(-1, self.prediction_horizon)
+        # Every run of consecutive rows, as a view without copying. A window is
+        # kept if it starts and ends in the same trip (so it's all one trip,
+        # since a trip's rows are together) and its last stop has a known target.
+        n_starts = max(len(df) - length + 1, 0)
+        starts = np.arange(n_starts)
+        ends = starts + length - 1
+        keep = (
+            (trip[starts] == trip[ends])
+            & ~np.isnan(trip[starts])
+            & ~np.isnan(targets[ends]).all(axis=1)
+        )
+        if n_starts:
+            windows = sliding_window_view(features, (length, features.shape[1]))
+            X = windows[:, 0][starts[keep]]
+        else:
+            X = np.empty((0, length, len(self.feature_columns)))
+        y = targets[ends[keep]]
 
         print(f"Created {len(X)} sequences of shape {X.shape}")
         if return_index:
-            return X, y, np.array(end_rows)
+            return X, y, index[ends[keep]]
         return X, y
 
     def build_model(self, input_shape: Tuple[int, int]):

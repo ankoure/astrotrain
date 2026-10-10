@@ -285,6 +285,56 @@ def test_window_with_no_known_target_is_skipped_and_others_stay_consecutive(lstm
     assert y.tolist() == [[50.0], [60.0], [70.0]]
 
 
+def per_trip_loop(lstm, df):
+    """The straightforward loop create_sequences replaced, as a reference"""
+    X, y, end_rows = [], [], []
+    for _, trip in df.groupby(lstm.TRIP_KEY):
+        features = trip[lstm.feature_columns].to_numpy(dtype=float)
+        targets = trip[lstm.target_columns].to_numpy(dtype=float)
+        for i in range(len(trip) - lstm.sequence_length + 1):
+            end = i + lstm.sequence_length - 1
+            if not np.isnan(targets[end]).all():
+                X.append(features[i : end + 1])
+                y.append(targets[end])
+                end_rows.append(trip.index[end])
+    return np.array(X), np.array(y), np.array(end_rows)
+
+
+@pytest.mark.parametrize("shuffle", [False, True], ids=["sorted", "shuffled"])
+def test_create_sequences_matches_a_per_trip_loop(lstm3, shuffle):
+    trips = [("Red", 8), ("Orange", 4), ("Blue", 2), ("Green-B", 6)]
+    df = pd.concat(
+        [
+            lamp_frame(20250901 + day, route, stations(0, n), n_trips=3, seed=day)
+            for day, (route, n) in enumerate(trips)
+        ],
+        ignore_index=True,
+    )
+    # Some arrivals weren't recorded, so some targets are unknown
+    rng = np.random.default_rng(0)
+    df.loc[rng.choice(len(df), 8, replace=False), "stop_timestamp"] = np.nan
+    out = lstm3.preprocess_data(df)
+    if shuffle:
+        out = out.sample(frac=1, random_state=0)
+
+    X, y, end_rows = lstm3.create_sequences(out, return_index=True)
+    X_ref, y_ref, end_rows_ref = per_trip_loop(lstm3, out)
+
+    assert len(X) > 0
+    np.testing.assert_array_equal(X, X_ref)
+    np.testing.assert_array_equal(y, y_ref)  # treats NaN as equal to NaN
+    np.testing.assert_array_equal(end_rows, end_rows_ref)
+
+
+def test_fewer_rows_than_the_window_gives_empty_arrays_of_the_right_shape(lstm):
+    df = lstm.preprocess_data(lamp_frame(20250901, "Red", stations(0, 2), n_trips=1))
+
+    X, y = lstm.create_sequences(df)
+
+    assert X.shape == (0, 3, len(lstm.feature_columns))
+    assert y.shape == (0, 1)
+
+
 # --- predicting several stops ahead ---
 
 
