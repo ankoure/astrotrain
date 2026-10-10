@@ -1,0 +1,29 @@
+name: test
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+# Cancel superseded runs on the same branch to save Actions minutes
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v7
+      # Python comes from .python-version, so CI always matches local
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10
+        with:
+          # TensorFlow is most of the install time; reuse it between runs
+          enable-cache: true
+      - name: Install dependencies
+        run: uv sync --group dev
+      - name: Test code with pytest
+        run: uv run pytest

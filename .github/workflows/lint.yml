@@ -1,0 +1,29 @@
+name: lint
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+# Cancel superseded runs on the same branch to save Actions minutes
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v7
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10
+      - name: Check uv.lock is up to date
+        run: uv lock --check
+      # --only-group dev installs just the dev tools at their locked versions,
+      # skipping TensorFlow and the rest of the project's dependencies
+      - name: Lint code check with Ruff
+        run: uv run --only-group dev ruff check --output-format=github .
+      - name: Format code check with Ruff
+        run: uv run --only-group dev ruff format --check .
