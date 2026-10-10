@@ -17,7 +17,16 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "pytest>=9.1.1",
     "ruff>=0.17.0",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+filterwarnings = [
+    # Raised inside Keras/TensorFlow under numpy 2, not by our code
+    "ignore:__array__ implementation doesn't accept a copy keyword:DeprecationWarning",
 ]
 
 [tool.ruff.lint]

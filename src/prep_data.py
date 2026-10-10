@@ -11,8 +11,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Data folder in the project root (parent of src)
+DATA_DIR = Path(__file__).parent.parent / "data"
 
-def download_index_csv():
+
+def download_index_csv(data_dir: Path = DATA_DIR):
     """
     Download MBTA subway on-time performance data from the official API.
     Saves the data to the data folder in the project root.
@@ -21,11 +24,6 @@ def download_index_csv():
     url = (
         "https://performancedata.mbta.com/lamp/subway-on-time-performance-v1/index.csv"
     )
-
-    # Get the project root directory (parent of src)
-    src_dir = Path(__file__).parent
-    project_root = src_dir.parent
-    data_dir = project_root / "data"
 
     # Ensure data directory exists
     data_dir.mkdir(exist_ok=True)

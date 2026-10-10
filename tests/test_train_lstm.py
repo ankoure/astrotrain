@@ -1,0 +1,197 @@
+import numpy as np
+import pandas as pd
+import pytest
+
+from astrotrain.train_lstm import CountdownClockLSTM, keras
+from tests.lamp_data import lamp_frame, stations
+
+
+def fit_scalers(lstm, parquet_files):
+    """Fit the feature/target scalers the way train() does, returning the data"""
+    X, y = lstm.create_sequences(lstm.preprocess_data(lstm.load_data(parquet_files)))
+    lstm.feature_scaler.fit(X.reshape(-1, X.shape[-1]))
+    lstm.target_scaler.fit(y)
+    return X, y
+
+
+# --- fit_encoders / preprocess_data ---
+
+
+def test_fit_encoders_includes_values_only_in_later_files(lstm, parquet_files):
+    first_day = pd.read_parquet(parquet_files[0])
+    last_day = pd.read_parquet(parquet_files[-1])
+
+    assert "Green-B" not in set(first_day["route_id"])
+    assert "Green-B" in lstm.route_encoder.classes_
+    assert set(last_day["parent_station"]) <= set(lstm.stop_encoder.classes_)
+
+
+def test_station_codes_match_across_file_batches(lstm, parquet_files):
+    # Regression: encoders used to be refit on each file batch, so the same
+    # station got a different code depending on which batch it was in
+    first = lstm.preprocess_data(lstm.load_data(parquet_files[:2]))
+    second = lstm.preprocess_data(lstm.load_data(parquet_files[2:4]))
+
+    first_codes = dict(zip(first["parent_station"], first["stop_encoded"]))
+    second_codes = dict(zip(second["parent_station"], second["stop_encoded"]))
+    shared = first_codes.keys() & second_codes.keys()
+
+    assert shared
+    assert all(first_codes[s] == second_codes[s] for s in shared)
+
+
+def test_target_is_next_stops_travel_time_within_each_trip(lstm):
+    df = lamp_frame(20250901, "Red", stations(0, 3), n_trips=2)
+    df["travel_time_seconds"] = [10.0, 20.0, 30.0, 11.0, 21.0, 31.0]
+    df = df.sample(frac=1, random_state=0)  # preprocess_data should restore order
+
+    out = lstm.preprocess_data(df)
+
+    # Each trip's last stop has no next stop, so it's dropped rather than
+    # borrowing the following trip's first travel time
+    targets = out.groupby("trip_id")["target_travel_time"].apply(list)
+    assert targets.tolist() == [[20.0, 30.0], [21.0, 31.0]]
+
+
+def test_missing_values_filled_with_median(lstm):
+    df = lamp_frame(20250901, "Red", stations(0, 4), n_trips=1)
+    df["dwell_time_seconds"] = [10.0, np.nan, 30.0, 50.0]
+
+    out = lstm.preprocess_data(df)
+
+    # The last stop is dropped before filling, so the median is of 10 and 30
+    assert out["dwell_time_seconds"].tolist() == [10.0, 20.0, 30.0]
+
+
+@pytest.mark.parametrize(
+    ("start_time", "hour"),
+    [(7 * 3600 + 15 * 60, 7), (25 * 3600 + 30 * 60, 1)],
+    ids=["morning", "past-midnight"],  # service-day times can run past 24:00
+)
+def test_hour_of_day(lstm, start_time, hour):
+    df = lamp_frame(20250901, "Red", stations(0, 2), n_trips=1)
+    df["start_time"] = start_time
+
+    out = lstm.preprocess_data(df)
+
+    assert out["hour_of_day"].tolist() == [hour]
+
+
+def test_day_of_week(lstm):
+    df = lamp_frame(20250906, "Red", stations(0, 2), n_trips=1)
+
+    out = lstm.preprocess_data(df)
+
+    assert out["day_of_week"].tolist() == [5]  # 2025-09-06 is a Saturday
+
+
+# --- create_sequences ---
+
+
+def test_sequence_window_and_target(lstm):
+    df = lamp_frame(20250901, "Red", stations(0, 6), n_trips=1)
+    df["travel_time_seconds"] = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0]
+
+    X, y = lstm.create_sequences(lstm.preprocess_data(df))
+
+    # Each window is 3 consecutive stops; the target is the travel time to the
+    # stop right after the window
+    travel_time = X[:, :, lstm.feature_columns.index("travel_time_seconds")]
+    assert travel_time.tolist() == [[10.0, 20.0, 30.0], [20.0, 30.0, 40.0]]
+    assert y.tolist() == [[40.0], [50.0]]
+
+
+def test_sequence_shapes(lstm):
+    df = lstm.preprocess_data(lamp_frame(20250901, "Red", stations(0, 8), n_trips=2))
+
+    X, y = lstm.create_sequences(df)
+
+    # 8 stops -> 7 rows with a target -> 7 - 3 = 4 windows per trip
+    assert X.shape == (8, 3, len(lstm.feature_columns))
+    assert y.shape == (8, 1)
+
+
+def test_windows_never_span_two_trips(lstm):
+    df = lstm.preprocess_data(lamp_frame(20250901, "Red", stations(0, 8), n_trips=3))
+
+    X, _ = lstm.create_sequences(df)
+
+    stop_sequence = X[:, :, lstm.feature_columns.index("stop_sequence")]
+    assert (np.diff(stop_sequence, axis=1) == 1).all()
+
+
+def test_trips_too_short_for_a_window_are_skipped(lstm):
+    df = lamp_frame(20250901, "Red", stations(0, 8), n_trips=2)
+    short_trip = (df["trip_id"] == "20250901-Red-1") & (df["stop_sequence"] >= 3)
+    df = df[~short_trip]
+
+    X, _ = lstm.create_sequences(lstm.preprocess_data(df))
+
+    assert len(X) == 4  # all from the full-length trip
+
+
+# --- sequence_generator / train ---
+
+
+def test_sequence_generator_yields_float32_batches_covering_all_data(
+    lstm, parquet_files
+):
+    X, _ = fit_scalers(lstm, parquet_files)
+
+    batches = list(
+        lstm.sequence_generator(parquet_files, file_batch_size=2, mini_batch_size=8)
+    )
+
+    assert all(xb.dtype == yb.dtype == np.float32 for xb, yb in batches)
+    assert all(len(xb) <= 8 for xb, _ in batches)
+    assert sum(len(xb) for xb, _ in batches) == len(X)
+
+
+# Keras warns once per pass while it learns the dataset's length; it's harmless
+@pytest.mark.filterwarnings("ignore:Your input ran out of data")
+def test_every_epoch_trains_on_all_files(lstm, parquet_files, tmp_path, monkeypatch):
+    # Regression: epochs after the first used to train on almost no data because
+    # the generator was exhausted after one pass
+    monkeypatch.chdir(tmp_path)  # train() writes its checkpoint to the working dir
+    batches_per_epoch = []
+
+    class CountBatches(keras.callbacks.Callback):
+        def on_epoch_begin(self, epoch, logs=None):
+            batches_per_epoch.append(0)
+
+        def on_train_batch_end(self, batch, logs=None):
+            batches_per_epoch[-1] += 1
+
+    fit = keras.Model.fit
+
+    def fit_with_counter(self, *args, **kwargs):
+        kwargs["callbacks"] = [*kwargs["callbacks"], CountBatches()]
+        return fit(self, *args, **kwargs)
+
+    monkeypatch.setattr(keras.Model, "fit", fit_with_counter)
+
+    lstm.train(parquet_files, epochs=3, batch_size=8, file_batch_size=2)
+
+    train_files = parquet_files[:4]  # train() holds out the last 20% for validation
+    expected = sum(1 for _ in lstm.sequence_generator(train_files, 2, 8))
+    assert batches_per_epoch == [expected] * 3
+
+
+# --- save / load ---
+
+
+# The model is saved untrained, so there's no optimizer state to restore
+@pytest.mark.filterwarnings("ignore:Skipping variable loading for optimizer")
+def test_save_and_load_round_trip(lstm, parquet_files, tmp_path):
+    X, _ = fit_scalers(lstm, parquet_files)
+    lstm.build_model(input_shape=X.shape[1:])
+    expected = lstm.predict(X)
+
+    lstm.save(str(tmp_path / "model"))
+    loaded = CountdownClockLSTM()
+    loaded.load(str(tmp_path / "model"))
+
+    np.testing.assert_allclose(loaded.predict(X), expected, rtol=1e-5)
+    assert loaded.sequence_length == lstm.sequence_length
+    assert loaded.feature_columns == lstm.feature_columns
+    assert list(loaded.stop_encoder.classes_) == list(lstm.stop_encoder.classes_)
