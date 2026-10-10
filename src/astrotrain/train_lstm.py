@@ -193,14 +193,15 @@ class CountdownClockLSTM:
 
         # Group by trip to maintain temporal continuity
         for _, trip_df in df.groupby(self.TRIP_KEY):
-            if len(trip_df) < self.sequence_length + 1:
+            if len(trip_df) < self.sequence_length:
                 continue
 
             trip_features = trip_df[self.feature_columns].values
             trip_targets = trip_df["target_travel_time"].values
 
-            # Create sliding windows
-            for i in range(len(trip_df) - self.sequence_length):
+            # Create sliding windows. Every row already has a target (the next
+            # stop's travel time), so a window can end on the trip's last row.
+            for i in range(len(trip_df) - self.sequence_length + 1):
                 X_sequences.append(trip_features[i : i + self.sequence_length])
                 y_targets.append(trip_targets[i + self.sequence_length - 1])
 

@@ -127,8 +127,12 @@ def test_sequence_window_and_target(lstm):
     # Each window is 3 consecutive stops; the target is the travel time to the
     # stop right after the window
     travel_time = X[:, :, lstm.feature_columns.index("travel_time_seconds")]
-    assert travel_time.tolist() == [[10.0, 20.0, 30.0], [20.0, 30.0, 40.0]]
-    assert y.tolist() == [[40.0], [50.0]]
+    assert travel_time.tolist() == [
+        [10.0, 20.0, 30.0],
+        [20.0, 30.0, 40.0],
+        [30.0, 40.0, 50.0],
+    ]
+    assert y.tolist() == [[40.0], [50.0], [60.0]]
 
 
 def test_sequence_shapes(lstm):
@@ -136,9 +140,20 @@ def test_sequence_shapes(lstm):
 
     X, y = lstm.create_sequences(df)
 
-    # 8 stops -> 7 rows with a target -> 7 - 3 = 4 windows per trip
-    assert X.shape == (8, 3, len(lstm.feature_columns))
-    assert y.shape == (8, 1)
+    # 8 stops -> 7 rows with a target -> 7 - 3 + 1 = 5 windows per trip
+    assert X.shape == (10, 3, len(lstm.feature_columns))
+    assert y.shape == (10, 1)
+
+
+@pytest.mark.parametrize(("n_stops", "n_windows"), [(3, 0), (4, 1), (5, 2)])
+def test_window_count_per_trip(lstm, n_stops, n_windows):
+    # Regression: a trip's last window used to be skipped, so a trip with
+    # exactly sequence_length (3) rows gave none
+    df = lamp_frame(20250901, "Red", stations(0, n_stops), n_trips=1)
+
+    X, y = lstm.create_sequences(lstm.preprocess_data(df))
+
+    assert len(X) == len(y) == n_windows
 
 
 def test_windows_never_span_two_trips(lstm):
@@ -148,16 +163,6 @@ def test_windows_never_span_two_trips(lstm):
 
     stop_sequence = X[:, :, lstm.feature_columns.index("stop_sequence")]
     assert (np.diff(stop_sequence, axis=1) == 1).all()
-
-
-def test_trips_too_short_for_a_window_are_skipped(lstm):
-    df = lamp_frame(20250901, "Red", stations(0, 8), n_trips=2)
-    short_trip = (df["trip_id"] == "20250901-Red-1") & (df["stop_sequence"] >= 3)
-    df = df[~short_trip]
-
-    X, _ = lstm.create_sequences(lstm.preprocess_data(df))
-
-    assert len(X) == 4  # all from the full-length trip
 
 
 # --- sequence_generator / train ---
