@@ -69,6 +69,12 @@ class CountdownClockLSTM:
     # trains sitting at a terminal, logged as hours-long trips), not real delays
     MAX_TRAVEL_TIME_SECONDS = 30 * 60
 
+    # Typical times are looked up by these, plus the departure hour. An hour with
+    # fewer trips than the minimum falls back to the station's all-day median.
+    TYPICAL_TIME_KEY = ["route_id", "direction_id", "parent_station"]
+    TYPICAL_TIME_MIN_COUNT = 20
+    TIMEZONE = "America/New_York"
+
     # Numeric columns filled with their training median when missing
     FILLED_COLUMNS = [
         "dwell_time_seconds",
@@ -104,12 +110,18 @@ class CountdownClockLSTM:
         self.route_encoder = LabelEncoder()
         self.stop_encoder = LabelEncoder()
         self.fill_values = {}
+        self.typical_times = {}
         self.feature_columns = []
 
     @property
     def target_columns(self) -> List[str]:
         """Seconds from leaving a stop to arriving 1, 2, ... stops ahead"""
         return [f"target_{k}" for k in range(1, self.prediction_horizon + 1)]
+
+    @property
+    def typical_time_columns(self) -> List[str]:
+        """Historical median of each target, an input known at prediction time"""
+        return [f"typical_time_{k}" for k in range(1, self.prediction_horizon + 1)]
 
     @property
     def scheduled_target_columns(self) -> List[str]:
@@ -151,6 +163,40 @@ class CountdownClockLSTM:
         """
         medians = df[self.FILLED_COLUMNS].median()
         self.fill_values = medians.fillna(0).to_dict()
+
+    def fit_typical_times(self, parquet_files: List[str], file_batch_size: int = 5):
+        """
+        Learn the typical (median) time from leaving each station to arriving k
+        stops later, by route, direction and departure hour. The model gets these
+        as inputs: a lookup like this was nearly as accurate as the model alone,
+        and more accurate 1 stop ahead and on Orange, Green-C, Blue and Mattapan.
+
+        Fit on training files only, so validation stays unseen.
+        """
+        parts = []
+        for i in range(0, len(parquet_files), file_batch_size):
+            df = self.load_data(parquet_files[i : i + file_batch_size])
+            df = df.sort_values([*self.TRIP_KEY, "stop_sequence"])
+            df = df.reset_index(drop=True)
+            self._add_targets(df)
+            self._add_departure_hour(df)
+            parts.append(
+                df[[*self.TYPICAL_TIME_KEY, "departure_hour", *self.target_columns]]
+            )
+        history = pd.concat(parts, ignore_index=True).rename(
+            columns=dict(zip(self.target_columns, self.typical_time_columns))
+        )
+
+        columns = self.typical_time_columns
+        by_hour = history.groupby([*self.TYPICAL_TIME_KEY, "departure_hour"])[columns]
+        self.typical_times = {
+            "by_hour": by_hour.median().where(
+                by_hour.count() >= self.TYPICAL_TIME_MIN_COUNT
+            ),
+            "all_day": history.groupby(self.TYPICAL_TIME_KEY)[columns].median(),
+            "overall": history[columns].median(),
+        }
+        print(f"Typical times from {len(history):,} departures")
 
     def sequence_generator(
         self,
@@ -248,17 +294,45 @@ class CountdownClockLSTM:
             scheduled = scheduled + trips["scheduled_travel_time"].shift(-k)
             df[f"target_scheduled_{k}"] = scheduled - dwell_done
 
+    def _add_departure_hour(self, df: pd.DataFrame):
+        """Local hour the train was at each stop (missing if not recorded)"""
+        at_stop = pd.to_datetime(df["stop_timestamp"], unit="s", utc=True)
+        # Always float, so lookup keys match whether or not any hour is missing
+        hour = at_stop.dt.tz_convert(self.TIMEZONE).dt.hour
+        df["departure_hour"] = hour.astype("float64")
+
+    def _add_typical_times(self, df: pd.DataFrame):
+        """
+        Add typical_time_k for each row: the learned median for its route,
+        direction, station and hour, else its all-day median, else the overall one
+        """
+        columns = self.typical_time_columns
+        by_hour = df.join(
+            self.typical_times["by_hour"],
+            on=[*self.TYPICAL_TIME_KEY, "departure_hour"],
+        )[columns]
+        all_day = df.join(self.typical_times["all_day"], on=self.TYPICAL_TIME_KEY)
+        df[columns] = by_hour.fillna(all_day[columns]).fillna(
+            self.typical_times["overall"]
+        )
+
     def preprocess_data(self, df: pd.DataFrame) -> pd.DataFrame:
         """Clean and prepare data for modeling"""
         if not self.fill_values:
             raise RuntimeError(
                 "Fill values aren't fit yet: call fit_fill_values() or load a model"
             )
+        if not self.typical_times:
+            raise RuntimeError(
+                "Typical times aren't fit yet: call fit_typical_times() or load a model"
+            )
 
         # Sort by trip and stop sequence
         df = df.sort_values([*self.TRIP_KEY, "stop_sequence"]).reset_index(drop=True)
 
         self._add_targets(df)
+        self._add_departure_hour(df)
+        self._add_typical_times(df)
 
         # Treat impossible travel times as missing
         df["travel_time_seconds"] = df["travel_time_seconds"].where(
@@ -317,6 +391,7 @@ class CountdownClockLSTM:
             "day_of_week",
             "direction_binary",
             "stop_count",
+            *self.typical_time_columns,
         ]
 
         length = self.sequence_length
@@ -405,9 +480,18 @@ class CountdownClockLSTM:
             file_batch_size: Number of parquet files to load at once
                            (adjust based on RAM)
         """
-        # Fit encoders on all files, then scalers on a sample of data
+        # Split files into train/val sets (time-based split)
+        split_idx = int(len(parquet_files) * 0.8)
+        train_files = parquet_files[:split_idx]
+        val_files = parquet_files[split_idx:]
+
+        # Fit encoders on all files, typical times on the training files, then
+        # fill values and scalers on a sample of data
         print("Fitting encoders on all files...")
         self.fit_encoders(parquet_files)
+
+        print("Fitting typical times on the training files...")
+        self.fit_typical_times(train_files, file_batch_size)
 
         print("Fitting fill values and scalers on initial data sample...")
         sample_files = parquet_files[: min(10, len(parquet_files))]
@@ -452,11 +536,6 @@ class CountdownClockLSTM:
             save_weights_only=True,
             verbose=1,
         )
-
-        # Split files into train/val sets (time-based split)
-        split_idx = int(len(parquet_files) * 0.8)
-        train_files = parquet_files[:split_idx]
-        val_files = parquet_files[split_idx:]
 
         print(
             f"\nTraining on {len(train_files)} files, "
@@ -526,6 +605,7 @@ class CountdownClockLSTM:
                     "route_encoder": self.route_encoder,
                     "stop_encoder": self.stop_encoder,
                     "fill_values": self.fill_values,
+                    "typical_times": self.typical_times,
                     "feature_columns": self.feature_columns,
                     "sequence_length": self.sequence_length,
                     "prediction_horizon": self.prediction_horizon,
@@ -548,6 +628,7 @@ class CountdownClockLSTM:
             self.route_encoder = saved_objects["route_encoder"]
             self.stop_encoder = saved_objects["stop_encoder"]
             self.fill_values = saved_objects["fill_values"]
+            self.typical_times = saved_objects["typical_times"]
             self.feature_columns = saved_objects["feature_columns"]
             self.sequence_length = saved_objects["sequence_length"]
             self.prediction_horizon = saved_objects["prediction_horizon"]

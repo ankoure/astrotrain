@@ -187,6 +187,84 @@ def test_day_of_week(lstm):
     assert set(out["day_of_week"]) == {5}  # 2025-09-06 is a Saturday
 
 
+def trips_from_first_station(start_time, leg_times):
+    """Red trips from place-s0 to place-s1 leaving minutes apart, one per leg time"""
+    frames = []
+    for i, leg in enumerate(leg_times):
+        df = lamp_frame(20250901, "Red", stations(0, 2), n_trips=1)
+        df["trip_id"] = f"{start_time}-{i}"
+        df["direction_id"] = True
+        df["start_time"] = start_time + i * 60
+        df["travel_time_seconds"] = [np.nan, leg]
+        frames.append(with_timestamps(df))
+    return pd.concat(frames, ignore_index=True)
+
+
+@pytest.fixture
+def lookup_lstm(lstm, tmp_path):
+    """lstm with typical times learned from 3 morning and 3 afternoon trips"""
+    history = pd.concat(
+        [
+            trips_from_first_station(6 * 3600, [10.0, 20.0, 60.0]),
+            trips_from_first_station(9 * 3600, [100.0, 110.0, 120.0]),
+        ]
+    )
+    history.to_parquet(tmp_path / "history.parquet")
+    lstm.TYPICAL_TIME_MIN_COUNT = 3
+    lstm.fit_typical_times([tmp_path / "history.parquet"])
+    return lstm
+
+
+def typical_time_leaving_first_station(lstm, df):
+    out = lstm.preprocess_data(df)
+    return out.loc[out["stop_sequence"] == 0, "typical_time_1"].iloc[0]
+
+
+@pytest.mark.parametrize(
+    ("start_time", "expected"),
+    [
+        (6 * 3600, 20.0),  # median of the morning trips
+        (9 * 3600, 110.0),  # median of the afternoon trips
+        (14 * 3600, 80.0),  # no trips that hour: all-day median of all six
+    ],
+    ids=["morning", "afternoon", "other-hour"],
+)
+def test_typical_time_is_the_median_for_station_and_hour(
+    lookup_lstm, start_time, expected
+):
+    probe = trips_from_first_station(start_time, [999.0])
+
+    assert typical_time_leaving_first_station(lookup_lstm, probe) == expected
+
+
+def test_too_few_trips_in_an_hour_falls_back_to_the_all_day_median(
+    lookup_lstm, tmp_path
+):
+    lookup_lstm.TYPICAL_TIME_MIN_COUNT = 4  # each hour has only 3
+    lookup_lstm.fit_typical_times([tmp_path / "history.parquet"])
+    probe = trips_from_first_station(6 * 3600, [999.0])
+
+    assert typical_time_leaving_first_station(lookup_lstm, probe) == 80.0
+
+
+def test_unseen_station_uses_the_overall_median(lookup_lstm):
+    probe = lamp_frame(20250901, "Red", stations(5, 2), n_trips=1)
+
+    out = lookup_lstm.preprocess_data(probe)
+
+    overall = lookup_lstm.typical_times["overall"]["typical_time_1"]
+    assert out.loc[0, "typical_time_1"] == overall
+
+
+def test_preprocess_before_fitting_typical_times_raises(parquet_files):
+    lstm = CountdownClockLSTM()
+    lstm.fit_encoders(parquet_files)
+    lstm.fit_fill_values(lstm.load_data(parquet_files))
+
+    with pytest.raises(RuntimeError, match="fit_typical_times"):
+        lstm.preprocess_data(lamp_frame(20250901, "Red", stations(0, 3), n_trips=1))
+
+
 # --- create_sequences ---
 
 
@@ -462,6 +540,7 @@ def test_same_seed_gives_same_shuffle(parquet_files):
     def first_pass(seed):
         lstm = CountdownClockLSTM(sequence_length=3, prediction_horizon=3, seed=seed)
         lstm.fit_encoders(parquet_files)
+        lstm.fit_typical_times(parquet_files)
         lstm.fit_fill_values(lstm.load_data(parquet_files))
         fit_scalers(lstm, parquet_files)
         return windows(lstm.sequence_generator(parquet_files, 2, 8, shuffle=True))
@@ -525,6 +604,26 @@ def test_training_fails_clearly_when_no_trip_reaches_the_horizon(
         lstm.train(parquet_files, epochs=1, batch_size=8, file_batch_size=2)
 
 
+@pytest.mark.filterwarnings("ignore:Your input ran out of data")
+def test_typical_times_are_learned_from_training_files_only(
+    lstm, parquet_files, tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    seen = []
+    fit = lstm.fit_typical_times
+
+    def record(files, *args):
+        seen.extend(files)
+        return fit(files, *args)
+
+    monkeypatch.setattr(lstm, "fit_typical_times", record)
+
+    lstm.train(parquet_files, epochs=1, batch_size=8, file_batch_size=2)
+
+    # train() validates on the last 20% (the 5th file), which must stay unseen
+    assert seen == parquet_files[:4]
+
+
 # --- save / load ---
 
 
@@ -546,3 +645,7 @@ def test_save_and_load_round_trip(lstm3, parquet_files, tmp_path):
     assert loaded.feature_columns == lstm3.feature_columns
     assert list(loaded.stop_encoder.classes_) == list(lstm3.stop_encoder.classes_)
     assert loaded.fill_values == lstm3.fill_values
+    for table in ("by_hour", "all_day"):
+        pd.testing.assert_frame_equal(
+            loaded.typical_times[table], lstm3.typical_times[table]
+        )

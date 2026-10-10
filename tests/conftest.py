@@ -10,11 +10,12 @@ def parquet_files(tmp_path):
 
 
 def fitted_model(parquet_files, prediction_horizon):
-    """Small model with encoders and fill values fit on parquet_files"""
+    """Small model with encoders, typical times and fill values fit on parquet_files"""
     model = CountdownClockLSTM(
         sequence_length=3, prediction_horizon=prediction_horizon, seed=0
     )
     model.fit_encoders(parquet_files)
+    model.fit_typical_times(parquet_files)
     model.fit_fill_values(model.load_data(parquet_files))
     return model
 
