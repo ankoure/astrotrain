@@ -165,25 +165,16 @@ class CountdownClockGBM:
         num_boost_round: int = 3000,
         early_stopping_rounds: int = 50,
         file_batch_size: int = 5,
-        typical_time_days: Optional[int] = None,
     ) -> lgb.Booster:
         """
         Fit the preprocessing as train() does for the LSTM (encoders on all files,
         typical times on the training files, fill values on a sample), then train
         on the first 80% of files with early stopping on the last 20%.
-
-        Args:
-            typical_time_days: Learn typical times from only this many of the most
-                               recent training files, since running times drift
-                               (None: all training files)
         """
         split = int(len(parquet_files) * 0.8)
         train_files, val_files = parquet_files[:split], parquet_files[split:]
-        typical_files = (
-            train_files[-typical_time_days:] if typical_time_days else train_files
-        )
         self.prep.fit_encoders(parquet_files)
-        self.prep.fit_typical_times(typical_files, file_batch_size)
+        self.prep.fit_typical_times(train_files, file_batch_size)
         self.prep.fit_fill_values(self.prep.load_data(parquet_files[:10]))
 
         train_table = self._tables(train_files, file_batch_size)

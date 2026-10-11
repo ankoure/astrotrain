@@ -129,27 +129,3 @@ def test_evaluate_command_runs_a_saved_gbm(
 
     # Same targets as the LSTM's evaluate test: 12 per trip, 4 trips
     assert "Compared 48 of 48 targets" in capsys.readouterr().out
-
-
-@pytest.mark.parametrize(("days", "expected"), [(None, 4), (2, 2)])
-def test_typical_times_from_the_most_recent_training_days(
-    parquet_files, monkeypatch, days, expected
-):
-    model = CountdownClockGBM(
-        use_train_ahead=False,
-        sequence_length=3,
-        prediction_horizon=3,
-        params={"num_leaves": 4, "min_data_in_leaf": 5},
-    )
-    seen = []
-    fit = model.prep.fit_typical_times
-    monkeypatch.setattr(
-        model.prep,
-        "fit_typical_times",
-        lambda files, *a: seen.extend(files) or fit(files, *a),
-    )
-
-    model.train(parquet_files, num_boost_round=5, typical_time_days=days)
-
-    # Training files are the first 4 of 5; the most recent come last
-    assert seen == parquet_files[:4][-expected:]
