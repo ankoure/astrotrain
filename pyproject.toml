@@ -13,6 +13,7 @@ dependencies = [
     "pyarrow>=21.0.0,<26.0.0",
     "numpy (>=2.3.3,<3.0.0)",
     "pandas>=2.3.3,<4.0.0",
+    "lightgbm>=4.5",
 ]
 
 [project.optional-dependencies]
