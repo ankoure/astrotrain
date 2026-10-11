@@ -341,12 +341,19 @@ def main():
         action="store_true",
         help="Leave out the train-ahead features",
     )
+    parser.add_argument(
+        "--without-line-ahead",
+        action="store_true",
+        help="Leave out the next stations' state (variant C, ~2%% better)",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--run-name", help="MLflow run name (default: random)")
     args = parser.parse_args()
 
     model = CountdownClockGBM(
-        use_train_ahead=not args.without_train_ahead, seed=args.seed
+        use_train_ahead=not args.without_train_ahead,
+        use_line_ahead=not args.without_line_ahead,
+        seed=args.seed,
     )
     with tracking.start_run(EXPERIMENT, "training", args.run_name):
         model.train(sorted(args.files))

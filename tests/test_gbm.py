@@ -222,3 +222,30 @@ def test_evaluating_a_tracked_model_nests_under_its_training_run(
     client = mlflow.MlflowClient()
     files = {item.path for item in client.list_artifacts(evaluation.info.run_id)}
     assert files == {"by_stops_ahead.csv", "by_route.csv"}
+
+
+@pytest.mark.parametrize(
+    ("flags", "train_ahead", "line_ahead"),
+    [([], True, True), (["--without-line-ahead"], True, False)],
+    ids=["default", "without-line-ahead"],
+)
+def test_training_command_trains_variant_c_by_default(
+    parquet_files, tmp_path, monkeypatch, flags, train_ahead, line_ahead
+):
+    import sys
+
+    from astrotrain.gbm import main
+
+    trained = []
+    monkeypatch.setattr(
+        CountdownClockGBM, "train", lambda self, files: trained.append(self)
+    )
+    monkeypatch.setattr(CountdownClockGBM, "save", lambda self, out: None)
+    monkeypatch.setattr(
+        sys, "argv", ["gbm", *parquet_files, "--out", str(tmp_path / "m"), *flags]
+    )
+
+    main()
+
+    assert trained[0].use_train_ahead is train_ahead
+    assert trained[0].use_line_ahead is line_ahead
