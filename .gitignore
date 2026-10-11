@@ -13,6 +13,7 @@ models/*/model.keras
 models/*/scalers.pkl
 models/*/gbm.txt
 models/*/preprocessing.pkl
+models/*/metadata.json
 models/*/weights/
 models/*/checkpoints/
 models/*/logs/
