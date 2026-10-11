@@ -28,7 +28,7 @@ from typing import List, Optional
 import lightgbm as lgb
 import pandas as pd
 
-from astrotrain.network import AHEAD_COLUMNS
+from astrotrain.network import AHEAD_COLUMNS, LINE_AHEAD_COLUMNS
 from astrotrain.train_lstm import CountdownClockLSTM
 
 # The last few legs, like the LSTM's window: this stop (lag 0) and the 3 before
@@ -76,6 +76,7 @@ class CountdownClockGBM:
     def __init__(
         self,
         use_train_ahead: bool,
+        use_line_ahead: bool = False,
         sequence_length: int = 5,
         prediction_horizon: int = 10,
         seed: int = 0,
@@ -84,6 +85,7 @@ class CountdownClockGBM:
         """
         Args:
             use_train_ahead: Include the train-ahead features (network.py)
+            use_line_ahead: Include the next stations' state (network.py)
             sequence_length: Predict only from a train's sequence_length-th stop
                              on, as the LSTM does, so both cover the same targets
             prediction_horizon: Number of stops ahead to predict arrival at
@@ -91,12 +93,17 @@ class CountdownClockGBM:
         """
         self.prep = CountdownClockLSTM(sequence_length, prediction_horizon, seed)
         self.use_train_ahead = use_train_ahead
+        self.use_line_ahead = use_line_ahead
         self.params = {**DEFAULT_PARAMS, "seed": seed, **(params or {})}
         self.booster: Optional[lgb.Booster] = None
 
     @property
     def feature_columns(self) -> List[str]:
-        return BASE_FEATURES + (AHEAD_COLUMNS if self.use_train_ahead else [])
+        return (
+            BASE_FEATURES
+            + (AHEAD_COLUMNS if self.use_train_ahead else [])
+            + (LINE_AHEAD_COLUMNS if self.use_line_ahead else [])
+        )
 
     def table(self, df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -212,6 +219,7 @@ class CountdownClockGBM:
                     "sequence_length": prep.sequence_length,
                     "prediction_horizon": prep.prediction_horizon,
                     "use_train_ahead": self.use_train_ahead,
+                    "use_line_ahead": self.use_line_ahead,
                     "params": self.params,
                 },
                 f,
@@ -229,6 +237,7 @@ class CountdownClockGBM:
             state = pickle.load(f)
         model = cls(
             use_train_ahead=state["use_train_ahead"],
+            use_line_ahead=state.get("use_line_ahead", False),
             sequence_length=state["sequence_length"],
             prediction_horizon=state["prediction_horizon"],
             params=state["params"],

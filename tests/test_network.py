@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from astrotrain.network import AHEAD_COLUMNS
+from astrotrain.network import AHEAD_COLUMNS, LINE_AHEAD_COLUMNS
 from tests.lamp_data import lamp_frame, stations, with_timestamps
 
 START = 6 * 3600
@@ -96,3 +96,53 @@ def test_a_train_that_left_long_ago_is_not_ahead(lstm):
     leaving_first_stop = ours(lstm.preprocess_data(df)).loc[0]
 
     assert leaving_first_stop["ahead_missing"] == 1
+
+
+# --- the next stations' state ---
+
+
+def test_line_ahead_state_at_departure(lstm):
+    # As before: the train ahead reaches place-s1 at +110s and leaves at +120s,
+    # and reaches place-s2 at +220s; ours leaves place-s0 at +160s
+    df = pd.concat([trip("ahead", START), trip("ours", START + 150)])
+
+    leaving = ours(lstm.preprocess_data(df)).loc[0]
+
+    # The leg into place-s1: finished by the train ahead 50s ago, taking 100s
+    assert leaving["leg_excess_now_1"] == pytest.approx(
+        100.0 - leaving["typical_time_1"]
+    )
+    assert leaving["leg_age_1"] == 50.0
+    # Nobody at place-s1 now; the last train there stayed 10s
+    assert leaving["occupied_for_1"] == 0.0
+    assert leaving["last_dwell_1"] == 10.0
+    # Nobody has finished the leg into place-s2 or left it yet
+    assert np.isnan(leaving["leg_excess_now_2"])
+    assert np.isnan(leaving["last_dwell_2"])
+
+
+def test_a_train_at_the_next_stop_counts_as_occupying_it(lstm):
+    # Ours leaves place-s0 at +115s: the train ahead got to place-s1 at +110s
+    # and won't leave until +120s
+    df = pd.concat([trip("ahead", START), trip("ours", START + 105)])
+
+    leaving = ours(lstm.preprocess_data(df)).loc[0]
+
+    assert leaving["occupied_for_1"] == 5.0
+
+
+@pytest.mark.parametrize("behind", [105, 150, 205])
+def test_line_ahead_uses_nothing_after_our_departure(lstm, behind):
+    df = pd.concat([trip("ahead", START), trip("ours", START + behind)])
+    out = ours(lstm.preprocess_data(df))
+
+    for stop, departure in out["departure_time"].dropna().items():
+        cut = df.copy()
+        later = (cut["trip_id"] == "ahead") & (cut["stop_timestamp"] > departure)
+        cut.loc[later, ["stop_timestamp", "move_timestamp"]] = np.nan
+        moved_later = (cut["trip_id"] == "ahead") & (cut["move_timestamp"] > departure)
+        cut.loc[moved_later, "move_timestamp"] = np.nan
+
+        recomputed = ours(lstm.preprocess_data(cut)).loc[stop, LINE_AHEAD_COLUMNS]
+
+        pd.testing.assert_series_equal(recomputed, out.loc[stop, LINE_AHEAD_COLUMNS])

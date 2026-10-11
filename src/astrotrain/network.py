@@ -8,8 +8,9 @@ train behind was 3-4x as likely to be over 2 minutes late a few stops on.
 For each departure this adds the state of the train ahead: the previous train to
 leave the same station, in the same direction, on the same trunk (so a Green-C
 train's train ahead can be a Green-B train, and Ashmont and Braintree trains
-share the Red Line trunk). Only events that had already happened when our train
-left are used.
+share the Red Line trunk). add_line_ahead adds the state of the next few stations
+and legs of the trip, from every train on the trunk. Only events that had
+already happened when our train left are used.
 """
 
 from typing import List
@@ -121,3 +122,125 @@ def add_train_ahead(
         filled = np.zeros(len(df)) if column != "ahead_missing" else np.ones(len(df))
         filled[rows] = values[column]
         df[column] = filled
+
+
+# How many stations ahead add_line_ahead describes
+LINE_AHEAD_STOPS = 3
+
+LINE_AHEAD_COLUMNS = [
+    f"{name}_{j}"
+    for j in range(1, LINE_AHEAD_STOPS + 1)
+    for name in ("leg_excess_now", "leg_age", "occupied_for", "last_dwell")
+]
+
+
+def add_line_ahead(
+    df: pd.DataFrame, trip_key: List[str], max_leg_seconds: float
+) -> None:
+    """
+    Add the state of the next LINE_AHEAD_STOPS stops of each row's trip at its
+    departure, from all trains on the same trunk in the same direction:
+
+      leg_excess_now_j: how much slower than typical the most recent train to
+                        finish the leg into the j-th stop ahead was (a slow zone
+                        or an incident shows up here first)
+      leg_age_j: seconds since that train got there; an old reading means little
+      occupied_for_j: seconds a train has been at the j-th stop ahead, if one is
+                      there now (arrived, not yet left), else 0
+      last_dwell_j: seconds the most recent train to leave that stop spent there
+
+    Unknown values are left missing (NaN). df needs a RangeIndex and must be
+    sorted by trip and stop, with departure_time and typical_time_1 added.
+    """
+    trips = df.groupby(trip_key)
+    trunk = df["trunk_route_id"].fillna(df["route_id"])
+    line = {
+        "service_date": df["service_date"],
+        "trunk": trunk,
+        "direction_id": df["direction_id"],
+    }
+    travel = df["travel_time_seconds"].where(
+        df["travel_time_seconds"] <= max_leg_seconds
+    )
+    # Every stop visit, as the events other trains will look up
+    visits = pd.DataFrame(
+        {
+            **line,
+            "from_station": trips["parent_station"].shift(1),
+            "station": df["parent_station"],
+            "arrived": df["stop_timestamp"],
+            "left": df["departure_time"],
+            # Slower than typical on the leg into this stop
+            "leg_excess": travel - trips["typical_time_1"].shift(1),
+        }
+    )
+    visits["dwell"] = visits["left"] - visits["arrived"]
+    keys = ["service_date", "trunk", "direction_id"]
+
+    # Each row's moment of departure and the stations ahead of it
+    queries = pd.DataFrame({**line, "at": df["departure_time"]})
+    queries["row"] = np.arange(len(df))
+    for j in range(1, LINE_AHEAD_STOPS + 1):
+        queries[f"from_{j}"] = trips["parent_station"].shift(-(j - 1))
+        queries[f"to_{j}"] = trips["parent_station"].shift(-j)
+    queries = queries.dropna(subset=["at"]).sort_values("at", kind="stable")
+
+    def latest(events, time, query_station_columns, event_station_columns):
+        """For each query, the latest event at or before its departure"""
+        events = events.dropna(subset=[time, *event_station_columns])
+        renamed = queries.rename(
+            columns=dict(zip(query_station_columns, event_station_columns))
+        )
+        renamed = renamed.dropna(subset=event_station_columns)
+        return pd.merge_asof(
+            renamed,
+            events.sort_values(time, kind="stable"),
+            left_on="at",
+            right_on=time,
+            by=keys + event_station_columns,
+            direction="backward",
+        )
+
+    for j in range(1, LINE_AHEAD_STOPS + 1):
+        columns = {
+            f"{name}_{j}": np.full(len(df), np.nan)
+            for name in ("leg_excess_now", "leg_age", "occupied_for", "last_dwell")
+        }
+
+        legs = latest(
+            visits[keys + ["from_station", "station", "arrived", "leg_excess"]],
+            "arrived",
+            [f"from_{j}", f"to_{j}"],
+            ["from_station", "station"],
+        )
+        rows = legs["row"].to_numpy()
+        columns[f"leg_excess_now_{j}"][rows] = legs["leg_excess"].to_numpy()
+        columns[f"leg_age_{j}"][rows] = (legs["at"] - legs["arrived"]).to_numpy()
+
+        # The latest train to arrive there; it's still there if it hasn't left
+        # by now (unrecorded departures count as still there)
+        arrivals = latest(
+            visits[keys + ["station", "arrived", "left"]],
+            "arrived",
+            [f"to_{j}"],
+            ["station"],
+        )
+        still_there = (
+            ~(arrivals["left"] <= arrivals["at"]) & arrivals["arrived"].notna()
+        )
+        rows = arrivals["row"].to_numpy()
+        columns[f"occupied_for_{j}"][rows] = np.where(
+            still_there, arrivals["at"] - arrivals["arrived"], 0.0
+        )
+
+        departures = latest(
+            visits[keys + ["station", "left", "dwell"]],
+            "left",
+            [f"to_{j}"],
+            ["station"],
+        )
+        rows = departures["row"].to_numpy()
+        columns[f"last_dwell_{j}"][rows] = departures["dwell"].to_numpy()
+
+        for name, values in columns.items():
+            df[name] = values

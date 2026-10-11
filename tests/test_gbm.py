@@ -4,7 +4,7 @@ import pytest
 
 from astrotrain.evaluate import evaluate
 from astrotrain.gbm import CountdownClockGBM
-from astrotrain.network import AHEAD_COLUMNS
+from astrotrain.network import AHEAD_COLUMNS, LINE_AHEAD_COLUMNS
 from tests.lamp_data import lamp_frame, stations, with_timestamps
 
 KEY = ["trip_id", "departure_time", "stops_ahead"]
@@ -129,3 +129,11 @@ def test_evaluate_command_runs_a_saved_gbm(
 
     # Same targets as the LSTM's evaluate test: 12 per trip, 4 trips
     assert "Compared 48 of 48 targets" in capsys.readouterr().out
+
+
+def test_line_ahead_columns_only_in_variant_c():
+    c = CountdownClockGBM(use_train_ahead=True, use_line_ahead=True).feature_columns
+    b = CountdownClockGBM(use_train_ahead=True).feature_columns
+
+    assert set(LINE_AHEAD_COLUMNS) <= set(c)
+    assert not set(LINE_AHEAD_COLUMNS) & set(b)
