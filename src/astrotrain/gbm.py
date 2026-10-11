@@ -12,8 +12,17 @@ ahead) and predicts exactly the same targets: arrival 1-10 stops ahead, from
 departures after a train's first sequence_length - 1 stops, so its results line
 up one-to-one with evaluate.evaluate() and work with summarize() and the MBTA
 head-to-head.
+
+It beat the LSTM by ~9% on the same inputs and the MBTA's own predictions by
+~23% (see the commit history), so it's the main model.
+
+usage: uv run python -m astrotrain.gbm data/2026-0[6-9]-*.parquet \
+           --out models/countdown_gbm
 """
 
+import argparse
+import pickle
+from pathlib import Path
 from typing import List, Optional
 
 import lightgbm as lgb
@@ -187,6 +196,49 @@ class CountdownClockGBM:
         )
         return self.booster
 
+    def save(self, path: str = "models/countdown_gbm"):
+        """Save the trees and the fitted preprocessing"""
+        path = Path(path)
+        path.mkdir(parents=True, exist_ok=True)
+        self.booster.save_model(str(path / "gbm.txt"))
+        prep = self.prep
+        with open(path / "preprocessing.pkl", "wb") as f:
+            pickle.dump(
+                {
+                    "route_encoder": prep.route_encoder,
+                    "stop_encoder": prep.stop_encoder,
+                    "fill_values": prep.fill_values,
+                    "typical_times": prep.typical_times,
+                    "sequence_length": prep.sequence_length,
+                    "prediction_horizon": prep.prediction_horizon,
+                    "use_train_ahead": self.use_train_ahead,
+                    "params": self.params,
+                },
+                f,
+            )
+        print(f"Model saved to {path}")
+
+    @staticmethod
+    def is_saved_in(path: str) -> bool:
+        return (Path(path) / "gbm.txt").exists()
+
+    @classmethod
+    def load(cls, path: str = "models/countdown_gbm") -> "CountdownClockGBM":
+        path = Path(path)
+        with open(path / "preprocessing.pkl", "rb") as f:
+            state = pickle.load(f)
+        model = cls(
+            use_train_ahead=state["use_train_ahead"],
+            sequence_length=state["sequence_length"],
+            prediction_horizon=state["prediction_horizon"],
+            params=state["params"],
+        )
+        for name in ("route_encoder", "stop_encoder", "fill_values", "typical_times"):
+            setattr(model.prep, name, state[name])
+        model.booster = lgb.Booster(model_file=str(path / "gbm.txt"))
+        print(f"Model loaded from {path}")
+        return model
+
     def results(self, df: pd.DataFrame) -> pd.DataFrame:
         """
         Predict raw LAMP data, in the same format as evaluate.evaluate(): one row
@@ -212,3 +264,28 @@ class CountdownClockGBM:
 
 # Features that differ by stops ahead, filled per horizon in table()
 _PER_HORIZON = {"stops_ahead", "typical_time", "scheduled"}
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Train the LightGBM countdown clock model on LAMP files"
+    )
+    parser.add_argument("files", nargs="+", help="Daily LAMP parquet files")
+    parser.add_argument("--out", default="models/countdown_gbm", help="Where to save")
+    parser.add_argument(
+        "--without-train-ahead",
+        action="store_true",
+        help="Leave out the train-ahead features",
+    )
+    parser.add_argument("--seed", type=int, default=0)
+    args = parser.parse_args()
+
+    model = CountdownClockGBM(
+        use_train_ahead=not args.without_train_ahead, seed=args.seed
+    )
+    model.train(sorted(args.files))
+    model.save(args.out)
+
+
+if __name__ == "__main__":
+    main()

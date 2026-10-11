@@ -14,6 +14,9 @@ evaluated days fully cover.
 Use days the model wasn't trained on. train() validates on the last 20% of its
 files, so later days are the cleanest test.
 
+--model can be a saved LightGBM model (the default, models/countdown_gbm) or
+LSTM model.
+
 usage: uv run python -m astrotrain.evaluate data/2026-10-0*.parquet
        uv run python -m astrotrain.evaluate --mbta-accuracy \
            data/mbta_prediction_accuracy.csv data/2026-08-2*.parquet
@@ -25,6 +28,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from astrotrain.gbm import CountdownClockGBM
 from astrotrain.train_lstm import CountdownClockLSTM
 
 
@@ -268,7 +272,9 @@ def main():
     )
     parser.add_argument("files", nargs="+", help="LAMP parquet files to evaluate on")
     parser.add_argument(
-        "--model", default="models/countdown_lstm", help="Saved model directory"
+        "--model",
+        default="models/countdown_gbm",
+        help="Saved model directory, LightGBM or LSTM",
     )
     parser.add_argument(
         "--mbta-predictions",
@@ -283,9 +289,13 @@ def main():
     )
     args = parser.parse_args()
 
-    lstm = CountdownClockLSTM()
-    lstm.load(args.model)
-    results = evaluate(lstm, lstm.load_data(sorted(args.files)))
+    if CountdownClockGBM.is_saved_in(args.model):
+        gbm = CountdownClockGBM.load(args.model)
+        results = gbm.results(gbm.prep.load_data(sorted(args.files)))
+    else:
+        lstm = CountdownClockLSTM()
+        lstm.load(args.model)
+        results = evaluate(lstm, lstm.load_data(sorted(args.files)))
 
     by_stops = summarize(results, "stops_ahead")
     compared = by_stops.loc["all", "targets"]

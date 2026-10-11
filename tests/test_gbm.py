@@ -86,3 +86,46 @@ def test_train_and_results_match_evaluate_format(parquet_files, built_lstm):
     np.testing.assert_array_equal(
         results["predicted"], trained(seed=0).results(raw)["predicted"]
     )
+
+
+@pytest.fixture
+def trained_gbm(parquet_files):
+    model = CountdownClockGBM(
+        use_train_ahead=True,
+        sequence_length=3,
+        prediction_horizon=3,
+        params={"num_leaves": 4, "min_data_in_leaf": 5},
+    )
+    model.train(parquet_files, num_boost_round=20, file_batch_size=2)
+    return model
+
+
+def test_save_and_load_round_trip(trained_gbm, parquet_files, tmp_path):
+    raw = trained_gbm.prep.load_data(parquet_files[-1:])
+    expected = trained_gbm.results(raw)
+
+    trained_gbm.save(tmp_path / "model")
+    loaded = CountdownClockGBM.load(tmp_path / "model")
+
+    pd.testing.assert_frame_equal(loaded.results(raw), expected)
+    assert loaded.use_train_ahead
+    assert loaded.prep.prediction_horizon == 3
+    assert CountdownClockGBM.is_saved_in(tmp_path / "model")
+
+
+def test_evaluate_command_runs_a_saved_gbm(
+    trained_gbm, parquet_files, tmp_path, monkeypatch, capsys
+):
+    import sys
+
+    from astrotrain.evaluate import main
+
+    trained_gbm.save(tmp_path / "model")
+    monkeypatch.setattr(
+        sys, "argv", ["evaluate", "--model", str(tmp_path / "model"), parquet_files[-1]]
+    )
+
+    main()
+
+    # Same targets as the LSTM's evaluate test: 12 per trip, 4 trips
+    assert "Compared 48 of 48 targets" in capsys.readouterr().out
