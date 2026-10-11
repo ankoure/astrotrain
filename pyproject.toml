@@ -15,6 +15,7 @@ dependencies = [
     "pandas>=2.3.3,<4.0.0",
     "lightgbm>=4.5",
     "boto3>=1.35",
+    "mlflow>=3.17.0",
 ]
 
 [project.optional-dependencies]
@@ -34,6 +35,8 @@ testpaths = ["tests"]
 filterwarnings = [
     # Raised inside Keras/TensorFlow under numpy 2, not by our code
     "ignore:__array__ implementation doesn't accept a copy keyword:DeprecationWarning",
+    # Raised inside MLflow's sqlite store under SQLAlchemy 2.1
+    "ignore:The ``noload`` loader strategy is deprecated:DeprecationWarning",
 ]
 
 [tool.ruff.lint]

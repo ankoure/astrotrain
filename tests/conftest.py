@@ -4,6 +4,22 @@ from astrotrain.train_lstm import CountdownClockLSTM
 from tests.lamp_data import write_daily_files
 
 
+@pytest.fixture(scope="session")
+def tracking_dir(tmp_path_factory):
+    return tmp_path_factory.mktemp("tracking")
+
+
+@pytest.fixture(autouse=True)
+def track_in_tmp(tracking_dir, monkeypatch):
+    """
+    Keep MLflow runs out of the checkout: it writes mlflow.db and mlruns/ to the
+    working directory. One database for the whole session, as a new one takes
+    ~5 s to set up.
+    """
+    monkeypatch.chdir(tracking_dir)
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", f"sqlite:///{tracking_dir}/mlflow.db")
+
+
 @pytest.fixture
 def parquet_files(tmp_path):
     return write_daily_files(tmp_path / "data")

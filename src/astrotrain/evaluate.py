@@ -17,19 +17,29 @@ files, so later days are the cleanest test.
 --model can be a saved LightGBM model (the default, models/countdown_gbm) or
 LSTM model.
 
+Each evaluation is tracked in MLflow (tracking.py) with the model's settings,
+the evaluated days, the summary errors as metrics and every table as a CSV. An
+evaluation of a model from a tracked training run is nested under that run.
+
 usage: uv run python -m astrotrain.evaluate data/2026-10-0*.parquet
        uv run python -m astrotrain.evaluate --mbta-accuracy \
            data/mbta_prediction_accuracy.csv data/2026-08-2*.parquet
 """
 
 import argparse
+import json
 from pathlib import Path
 
+import mlflow
 import numpy as np
 import pandas as pd
 
+from astrotrain import tracking
+from astrotrain.gbm import EXPERIMENT as GBM_EXPERIMENT
 from astrotrain.gbm import CountdownClockGBM
 from astrotrain.train_lstm import CountdownClockLSTM
+
+LSTM_EXPERIMENT = "countdown_lstm"
 
 
 def evaluate(lstm: CountdownClockLSTM, df: pd.DataFrame) -> pd.DataFrame:
@@ -229,6 +239,11 @@ def _service_dates_in(week: str) -> list:
 
 
 def print_head_to_head(results: pd.DataFrame, feed_dir: str):
+    """
+    Print the head-to-head with the MBTA's archived predictions, and return the
+    reports: with the MBTA's prediction from the same moment, and with its first
+    after the train left. None if there are no archived predictions for the days.
+    """
     # Imported here: mbta_predictions imports from this module
     from astrotrain.mbta_predictions import (
         archive_files,
@@ -240,7 +255,7 @@ def print_head_to_head(results: pd.DataFrame, feed_dir: str):
     files = archive_files(Path(feed_dir), results["service_date"].unique())
     if not files:
         print(f"\nNo archived MBTA predictions in {feed_dir} for these days")
-        return
+        return None
     predictions = load_mbta_predictions(files)
     report = head_to_head(attach_mbta_predictions(results, predictions))
     print(
@@ -264,6 +279,40 @@ def print_head_to_head(results: pd.DataFrame, feed_dir: str):
         f"MBTA {overall['mbta']}s ({overall['ours_vs_mbta']})\n"
     )
     print(after["by_route"].to_string())
+    return report, after
+
+
+def log_summaries(by_stops: pd.DataFrame, by_route: pd.DataFrame):
+    """
+    Log summarize() tables to the active MLflow run: the overall row as metrics
+    (model_mae, schedule_mae, ...), the model's MAE for each stops ahead and
+    route (model_mae_by_stops_ahead/3, model_mae_by_route/Red), and the tables
+    """
+    metrics = by_stops.loc["all"].astype(float).to_dict()
+    for by, table in (("stops_ahead", by_stops), ("route", by_route)):
+        for value, mae in table["model_mae"].drop("all").items():
+            metrics[f"model_mae_by_{by}/{value}"] = float(mae)
+        mlflow.log_text(table.to_csv(), f"by_{by}.csv")
+    mlflow.log_metrics(metrics)
+
+
+def log_head_to_head(report: dict, after: dict):
+    """
+    Log print_head_to_head() reports to the active MLflow run: overall MAE and
+    coverage as metrics (vs_mbta/ours_mae, vs_mbta_after_departure/mbta_mae,
+    ...), and the tables
+    """
+    for prefix, r in (("vs_mbta", report), ("vs_mbta_after_departure", after)):
+        overall = r["by_stops_ahead"].loc["all"]
+        mlflow.log_metrics(
+            {
+                f"{prefix}/ours_mae": float(overall["ours"]),
+                f"{prefix}/mbta_mae": float(overall["mbta"]),
+                f"{prefix}/coverage": r["coverage"],
+            }
+        )
+        for table in ("by_stops_ahead", "by_route", "accuracy"):
+            mlflow.log_text(r[table].to_csv(), f"{prefix}_{table}.csv")
 
 
 def main():
@@ -287,39 +336,75 @@ def main():
         help="MBTA prediction accuracy CSV, to compare against the MBTA's own "
         "predictions (prep_data.py downloads it)",
     )
+    parser.add_argument(
+        "--run-name", help="MLflow run name (default: the evaluated days)"
+    )
     args = parser.parse_args()
 
     if CountdownClockGBM.is_saved_in(args.model):
         gbm = CountdownClockGBM.load(args.model)
         results = gbm.results(gbm.prep.load_data(sorted(args.files)))
+        experiment = GBM_EXPERIMENT
     else:
         lstm = CountdownClockLSTM()
         lstm.load(args.model)
         results = evaluate(lstm, lstm.load_data(sorted(args.files)))
+        experiment = LSTM_EXPERIMENT
+    metadata_path = Path(args.model) / "metadata.json"
+    metadata = json.loads(metadata_path.read_text()) if metadata_path.exists() else {}
+    days = sorted(results["service_date"].unique())
+    first, last = _iso_date(days[0]), _iso_date(days[-1])
 
-    by_stops = summarize(results, "stops_ahead")
-    compared = by_stops.loc["all", "targets"]
-    print(
-        f"\nCompared {compared} of {len(results)} targets (the rest have no "
-        "scheduled time). Times and errors in seconds.\n"
-    )
-    print(by_stops.to_string())
-    print()
-    print(summarize(results, "route_id").to_string())
-
-    if args.mbta_predictions:
-        print_head_to_head(results, args.mbta_predictions)
-
-    if args.mbta_accuracy:
-        comparison = mbta_comparison(results, pd.read_csv(args.mbta_accuracy))
-        weeks = ", ".join(mbta_weeks(results["service_date"]))
-        print(
-            f"\nPercent of predictions accurate by the MBTA's rules, for MBTA "
-            f"weeks {weeks}. Context only: the MBTA's figures cover harder moments "
-            "than ours (see the schedule column); use --mbta-predictions for a "
-            "fair comparison.\n"
+    with tracking.start_run(
+        experiment,
+        "evaluation",
+        args.run_name or f"{first}..{last}",
+        training_run_id=metadata.get("mlflow_run_id"),
+    ):
+        mlflow.log_params(
+            {
+                "model_dir": args.model,
+                "eval_first_day": first,
+                "eval_last_day": last,
+                "eval_days": len(days),
+                **(tracking.model_params(metadata) if metadata else {}),
+            }
         )
-        print(comparison.to_string())
+        by_stops = summarize(results, "stops_ahead")
+        by_route = summarize(results, "route_id")
+        compared = by_stops.loc["all", "targets"]
+        print(
+            f"\nCompared {compared} of {len(results)} targets (the rest have no "
+            "scheduled time). Times and errors in seconds.\n"
+        )
+        print(by_stops.to_string())
+        print()
+        print(by_route.to_string())
+        log_summaries(by_stops, by_route)
+
+        if args.mbta_predictions:
+            reports = print_head_to_head(results, args.mbta_predictions)
+            if reports:
+                log_head_to_head(*reports)
+
+        if args.mbta_accuracy:
+            comparison = mbta_comparison(results, pd.read_csv(args.mbta_accuracy))
+            weeks = ", ".join(mbta_weeks(results["service_date"]))
+            print(
+                f"\nPercent of predictions accurate by the MBTA's rules, for MBTA "
+                f"weeks {weeks}. Context only: the MBTA's figures cover harder "
+                "moments than ours (see the schedule column); use "
+                "--mbta-predictions for a fair comparison.\n"
+            )
+            print(comparison.to_string())
+            # A table only, no metrics: it's context, not a result
+            mlflow.log_text(comparison.to_csv(), "mbta_accuracy.csv")
+
+
+def _iso_date(service_date) -> str:
+    """A YYYYMMDD service date as YYYY-MM-DD, like training days in metadata"""
+    date = str(service_date)
+    return f"{date[:4]}-{date[4:6]}-{date[6:]}"
 
 
 if __name__ == "__main__":

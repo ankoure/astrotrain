@@ -1,7 +1,12 @@
+import json
+from pathlib import Path
+
+import mlflow
 import numpy as np
 import pandas as pd
 import pytest
 
+from astrotrain import tracking
 from astrotrain.evaluate import evaluate
 from astrotrain.gbm import CountdownClockGBM
 from astrotrain.network import AHEAD_COLUMNS, LINE_AHEAD_COLUMNS
@@ -88,8 +93,7 @@ def test_train_and_results_match_evaluate_format(parquet_files, built_lstm):
     )
 
 
-@pytest.fixture
-def trained_gbm(parquet_files):
+def train_small(parquet_files):
     model = CountdownClockGBM(
         use_train_ahead=True,
         sequence_length=3,
@@ -98,6 +102,11 @@ def trained_gbm(parquet_files):
     )
     model.train(parquet_files, num_boost_round=20, file_batch_size=2)
     return model
+
+
+@pytest.fixture
+def trained_gbm(parquet_files):
+    return train_small(parquet_files)
 
 
 def test_save_and_load_round_trip(trained_gbm, parquet_files, tmp_path):
@@ -140,8 +149,6 @@ def test_line_ahead_columns_only_in_variant_c():
 
 
 def test_saved_metadata_says_how_the_model_was_made(trained_gbm, tmp_path):
-    import json
-
     trained_gbm.save(tmp_path / "model")
 
     metadata = json.loads((tmp_path / "model" / "metadata.json").read_text())
@@ -149,6 +156,69 @@ def test_saved_metadata_says_how_the_model_was_made(trained_gbm, tmp_path):
     assert metadata["training"]["days"] == 5
     assert metadata["training"]["first_day"] < metadata["training"]["last_day"]
     assert metadata["training"]["trees"] > 0
+    assert metadata["training"]["max_trees"] == 20
     assert metadata["settings"]["use_train_ahead"] is True
     assert metadata["features"] == trained_gbm.feature_columns
     assert len(metadata["commit"]) == 40  # the tests run from a git checkout
+    assert metadata["mlflow_run_id"] is None  # trained outside a run
+
+
+def test_training_and_saving_log_to_the_active_run(parquet_files, tmp_path):
+    with tracking.start_run("test", "training") as run:
+        model = train_small(parquet_files)
+        model.save(tmp_path / "model")
+
+    logged = mlflow.get_run(run.info.run_id)
+    assert logged.data.tags["kind"] == "training"
+    assert logged.data.tags["uncommitted_changes"] in {"True", "False"}
+    assert logged.data.params["num_leaves"] == "4"
+    assert logged.data.params["training_days"] == "5"
+    assert logged.data.params["training_trees"] == str(model.training["trees"])
+    assert logged.data.metrics["best_val_l1"] == pytest.approx(
+        model.booster.best_score["valid_0"]["l1"]
+    )
+    client = mlflow.MlflowClient()
+    curve = client.get_metric_history(run.info.run_id, "val_l1")
+    assert len(curve) == model.booster.current_iteration()  # every round
+    files = {item.path for item in client.list_artifacts(run.info.run_id, "model")}
+    assert files == {"model/gbm.txt", "model/preprocessing.pkl", "model/metadata.json"}
+    metadata = json.loads((tmp_path / "model" / "metadata.json").read_text())
+    assert metadata["mlflow_run_id"] == run.info.run_id
+
+
+def test_evaluating_a_tracked_model_nests_under_its_training_run(
+    parquet_files, tmp_path, monkeypatch, capsys
+):
+    import sys
+
+    from astrotrain.evaluate import main
+
+    with tracking.start_run("test", "training") as training:
+        train_small(parquet_files).save(tmp_path / "model")
+    monkeypatch.setattr(
+        sys, "argv", ["evaluate", "--model", str(tmp_path / "model"), parquet_files[-1]]
+    )
+
+    main()
+
+    evaluation = mlflow.last_active_run()
+    tags, params = evaluation.data.tags, evaluation.data.params
+    assert tags["kind"] == "evaluation"
+    assert tags["mlflow.parentRunId"] == training.info.run_id
+    assert evaluation.info.experiment_id == training.info.experiment_id
+    day = Path(parquet_files[-1]).name[:10]
+    assert evaluation.info.run_name == f"{day}..{day}"
+    assert params["eval_days"] == "1"
+    assert params["num_leaves"] == "4"  # the model's settings, as in training
+    metrics = evaluation.data.metrics
+    assert metrics["targets"] == 48
+    assert {
+        "model_mae",
+        "schedule_mae",
+        "model_mae_by_stops_ahead/1",
+        "model_mae_by_stops_ahead/3",
+        "model_mae_by_route/Green-B",
+    } <= set(metrics)
+    client = mlflow.MlflowClient()
+    files = {item.path for item in client.list_artifacts(evaluation.info.run_id)}
+    assert files == {"by_stops_ahead.csv", "by_route.csv"}

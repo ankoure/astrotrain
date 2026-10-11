@@ -16,23 +16,28 @@ head-to-head.
 It beat the LSTM by ~9% on the same inputs and the MBTA's own predictions by
 ~23% (see the commit history), so it's the main model.
 
+Training is tracked in MLflow (tracking.py), in the countdown_gbm experiment.
+
 usage: uv run python -m astrotrain.gbm data/2026-0[6-9]-*.parquet \
-           --out models/countdown_gbm
+           --out models/countdown_gbm [--run-name "variant C"]
 """
 
 import argparse
 import datetime
 import json
 import pickle
-import subprocess
 from pathlib import Path
 from typing import List, Optional
 
 import lightgbm as lgb
 import pandas as pd
 
+from astrotrain import tracking
 from astrotrain.network import AHEAD_COLUMNS, LINE_AHEAD_COLUMNS
 from astrotrain.train_lstm import CountdownClockLSTM
+
+# MLflow experiment for training and evaluating this model
+EXPERIMENT = "countdown_gbm"
 
 # The last few legs, like the LSTM's window: this stop (lag 0) and the 3 before
 LAGGED_COLUMNS = ["travel_time_seconds", "dwell_time_seconds", "leg_excess"]
@@ -181,11 +186,15 @@ class CountdownClockGBM:
         Fit the preprocessing as train() does for the LSTM (encoders on all files,
         typical times on the training files, fill values on a sample), then train
         on the first 80% of files with early stopping on the last 20%.
+
+        Logs the settings and validation error to the active MLflow run, if any.
         """
         self.training = {
             "first_day": _day(parquet_files[0]),
             "last_day": _day(parquet_files[-1]),
             "days": len(parquet_files),
+            "max_trees": num_boost_round,
+            "early_stopping_rounds": early_stopping_rounds,
         }
         split = int(len(parquet_files) * 0.8)
         train_files, val_files = parquet_files[:split], parquet_files[split:]
@@ -200,24 +209,27 @@ class CountdownClockGBM:
         )
         features = len(self.feature_columns)
         print(f"Training on {len(train_table):,} rows, {features} features")
+        self.training["rows"] = len(train_table)
+        callbacks = [lgb.early_stopping(early_stopping_rounds), lgb.log_evaluation(100)]
+        if tracking.active():
+            callbacks.append(tracking.log_lightgbm_evaluation)
         self.booster = lgb.train(
             self.params,
             train_set,
             num_boost_round=num_boost_round,
             valid_sets=[val_set],
-            callbacks=[
-                lgb.early_stopping(early_stopping_rounds),
-                lgb.log_evaluation(100),
-            ],
+            callbacks=callbacks,
         )
         self.training["trees"] = (
             self.booster.best_iteration or self.booster.current_iteration()
         )
+        if tracking.active():
+            tracking.log_training(self.metadata(), self.booster.best_score)
         return self.booster
 
     def metadata(self) -> dict:
         """How this model was made, saved with it as metadata.json"""
-        commit, dirty = _git_commit()
+        commit, dirty = tracking.git_commit()
         prep = self.prep
         return {
             "model": "lightgbm",
@@ -226,6 +238,7 @@ class CountdownClockGBM:
             ),
             "commit": commit,
             "uncommitted_changes": dirty,
+            "mlflow_run_id": tracking.active_run_id(),
             "training": self.training,
             "settings": {
                 "use_train_ahead": self.use_train_ahead,
@@ -238,7 +251,10 @@ class CountdownClockGBM:
         }
 
     def save(self, path: str = "models/countdown_gbm"):
-        """Save the trees and the fitted preprocessing"""
+        """
+        Save the trees and the fitted preprocessing, and log them to the active
+        MLflow run, if any
+        """
         path = Path(path)
         path.mkdir(parents=True, exist_ok=True)
         self.booster.save_model(str(path / "gbm.txt"))
@@ -262,6 +278,8 @@ class CountdownClockGBM:
             json.dumps(self.metadata(), indent=2) + "\n"
         )
         print(f"Model saved to {path}")
+        if tracking.active():
+            tracking.log_files(path, "model")
 
     @staticmethod
     def is_saved_in(path: str) -> bool:
@@ -324,41 +342,20 @@ def main():
         help="Leave out the train-ahead features",
     )
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--run-name", help="MLflow run name (default: random)")
     args = parser.parse_args()
 
     model = CountdownClockGBM(
         use_train_ahead=not args.without_train_ahead, seed=args.seed
     )
-    model.train(sorted(args.files))
-    model.save(args.out)
+    with tracking.start_run(EXPERIMENT, "training", args.run_name):
+        model.train(sorted(args.files))
+        model.save(args.out)
 
 
 def _day(path) -> str:
     """The service date in a LAMP file name (YYYY-MM-DD-...)"""
     return Path(path).name[:10]
-
-
-def _git_commit():
-    """This checkout's commit and whether it has uncommitted changes, if in git"""
-    here = Path(__file__).parent
-    try:
-        commit = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=here,
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout.strip()
-        status = subprocess.run(
-            ["git", "status", "--porcelain", "--untracked-files=no"],
-            cwd=here,
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout
-    except (OSError, subprocess.CalledProcessError):
-        return None, None
-    return commit, bool(status.strip())
 
 
 if __name__ == "__main__":

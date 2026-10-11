@@ -134,6 +134,21 @@ seconds:
 | `model_mae`, `model_median`, `model_p90` | Model's mean, median and 90th percentile absolute error |
 | `schedule_mae`, `schedule_median` | Schedule's mean and median absolute error |
 
+### 4. Compare runs
+
+Training the LightGBM model (`uv run python -m astrotrain.gbm`) and `evaluate`
+record each run with [MLflow](https://mlflow.org): the model's settings, the
+training and evaluated days, validation error by round, the summary errors as
+metrics, every printed table as a CSV, and the saved model. Evaluations are
+nested under the run that trained the model. Pass `--run-name` to label a run.
+
+Runs are kept in `mlflow.db` and `mlruns/` in the repository root (both
+gitignored). To browse and compare them:
+
+```bash
+uv run mlflow ui     # then open http://localhost:5000
+```
+
 ## Development
 
 ```bash

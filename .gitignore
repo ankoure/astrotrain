@@ -22,6 +22,7 @@ models/*/tensorboard/
 training_logs/
 experiments/
 mlruns/
+mlflow.db
 outputs/
 
 # Byte-compiled / optimized / DLL files
