@@ -137,3 +137,18 @@ def test_line_ahead_columns_only_in_variant_c():
 
     assert set(LINE_AHEAD_COLUMNS) <= set(c)
     assert not set(LINE_AHEAD_COLUMNS) & set(b)
+
+
+def test_saved_metadata_says_how_the_model_was_made(trained_gbm, tmp_path):
+    import json
+
+    trained_gbm.save(tmp_path / "model")
+
+    metadata = json.loads((tmp_path / "model" / "metadata.json").read_text())
+    assert metadata["model"] == "lightgbm"
+    assert metadata["training"]["days"] == 5
+    assert metadata["training"]["first_day"] < metadata["training"]["last_day"]
+    assert metadata["training"]["trees"] > 0
+    assert metadata["settings"]["use_train_ahead"] is True
+    assert metadata["features"] == trained_gbm.feature_columns
+    assert len(metadata["commit"]) == 40  # the tests run from a git checkout

@@ -11,6 +11,8 @@ temp_best_weights.weights.h5
 # Model directories (structure tracked, contents ignored)
 models/*/model.keras
 models/*/scalers.pkl
+models/*/gbm.txt
+models/*/preprocessing.pkl
 models/*/weights/
 models/*/checkpoints/
 models/*/logs/
@@ -229,3 +231,9 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Terraform: state and local settings stay out of git; the lock file is committed
+*.tfstate
+*.tfstate.*
+*.tfvars
+.terraform/

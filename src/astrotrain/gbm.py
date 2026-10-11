@@ -21,7 +21,10 @@ usage: uv run python -m astrotrain.gbm data/2026-0[6-9]-*.parquet \
 """
 
 import argparse
+import datetime
+import json
 import pickle
+import subprocess
 from pathlib import Path
 from typing import List, Optional
 
@@ -96,6 +99,7 @@ class CountdownClockGBM:
         self.use_line_ahead = use_line_ahead
         self.params = {**DEFAULT_PARAMS, "seed": seed, **(params or {})}
         self.booster: Optional[lgb.Booster] = None
+        self.training: dict = {}
 
     @property
     def feature_columns(self) -> List[str]:
@@ -178,6 +182,11 @@ class CountdownClockGBM:
         typical times on the training files, fill values on a sample), then train
         on the first 80% of files with early stopping on the last 20%.
         """
+        self.training = {
+            "first_day": _day(parquet_files[0]),
+            "last_day": _day(parquet_files[-1]),
+            "days": len(parquet_files),
+        }
         split = int(len(parquet_files) * 0.8)
         train_files, val_files = parquet_files[:split], parquet_files[split:]
         self.prep.fit_encoders(parquet_files)
@@ -201,7 +210,32 @@ class CountdownClockGBM:
                 lgb.log_evaluation(100),
             ],
         )
+        self.training["trees"] = (
+            self.booster.best_iteration or self.booster.current_iteration()
+        )
         return self.booster
+
+    def metadata(self) -> dict:
+        """How this model was made, saved with it as metadata.json"""
+        commit, dirty = _git_commit()
+        prep = self.prep
+        return {
+            "model": "lightgbm",
+            "saved_at": datetime.datetime.now(datetime.timezone.utc).isoformat(
+                timespec="seconds"
+            ),
+            "commit": commit,
+            "uncommitted_changes": dirty,
+            "training": self.training,
+            "settings": {
+                "use_train_ahead": self.use_train_ahead,
+                "use_line_ahead": self.use_line_ahead,
+                "sequence_length": prep.sequence_length,
+                "prediction_horizon": prep.prediction_horizon,
+                "params": self.params,
+            },
+            "features": self.feature_columns,
+        }
 
     def save(self, path: str = "models/countdown_gbm"):
         """Save the trees and the fitted preprocessing"""
@@ -224,6 +258,9 @@ class CountdownClockGBM:
                 },
                 f,
             )
+        (path / "metadata.json").write_text(
+            json.dumps(self.metadata(), indent=2) + "\n"
+        )
         print(f"Model saved to {path}")
 
     @staticmethod
@@ -294,6 +331,34 @@ def main():
     )
     model.train(sorted(args.files))
     model.save(args.out)
+
+
+def _day(path) -> str:
+    """The service date in a LAMP file name (YYYY-MM-DD-...)"""
+    return Path(path).name[:10]
+
+
+def _git_commit():
+    """This checkout's commit and whether it has uncommitted changes, if in git"""
+    here = Path(__file__).parent
+    try:
+        commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=here,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        status = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=no"],
+            cwd=here,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return None, None
+    return commit, bool(status.strip())
 
 
 if __name__ == "__main__":
