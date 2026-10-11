@@ -28,6 +28,7 @@ def lamp_frame(
                     "trip_id": f"{service_date}-{route_id}-{trip}",
                     "stop_sequence": seq,
                     "parent_station": station,
+                    "stop_id": f"{station}-01",  # the platform
                     "route_id": route_id,
                     # The shared line, e.g. "Green" for every Green branch;
                     # empty falls back to the route

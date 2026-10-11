@@ -44,6 +44,21 @@ def test_evaluate_gives_one_row_per_known_target(built_lstm):
     ]
     assert results["route_id"].tolist() == ["Red"] * 6
     assert results["predicted"].notna().all()
+    # Each target's stop, and the moment the prediction is made (leaving stop 2,
+    # 3 or 4)
+    assert results["stop_id"].tolist() == [
+        "place-s3-01",
+        "place-s4-01",
+        "place-s5-01",
+        "place-s4-01",
+        "place-s5-01",
+        "place-s5-01",
+    ]
+    out = built_lstm.preprocess_data(with_timestamps(df))
+    leaving = out.set_index("stop_sequence")["departure_time"]
+    assert results["departure_time"].tolist() == [leaving[2]] * 3 + [leaving[3]] * 2 + [
+        leaving[4]
+    ]
 
 
 @pytest.fixture

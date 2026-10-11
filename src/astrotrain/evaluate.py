@@ -20,6 +20,7 @@ usage: uv run python -m astrotrain.evaluate data/2026-10-0*.parquet
 """
 
 import argparse
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -30,18 +31,30 @@ from astrotrain.train_lstm import CountdownClockLSTM
 def evaluate(lstm: CountdownClockLSTM, df: pd.DataFrame) -> pd.DataFrame:
     """
     Predict every window in raw LAMP data, returning one row per known target:
-    its route, how many stops ahead it is, and the actual, predicted and
-    scheduled seconds from leaving the stop to arriving there.
+    its trip, route, the stop it's for and how many stops ahead that is, when the
+    prediction is made (departure_time, as the train leaves its current stop),
+    and the actual, predicted and scheduled seconds from leaving to arriving.
     """
     df = lstm.preprocess_data(df)
     X, y, end_rows = lstm.create_sequences(df, return_index=True)
     horizon = lstm.prediction_horizon
     window_ends = df.loc[end_rows]
+    stops_ahead = np.tile(np.arange(1, horizon + 1), len(X))
+
+    # A known target k stops ahead is k rows further down the same trip, since
+    # preprocess_data sorts each trip's stops together (RangeIndex)
+    target_rows = np.minimum(np.repeat(end_rows, horizon) + stops_ahead, len(df) - 1)
+
     results = pd.DataFrame(
         {
             "service_date": np.repeat(window_ends["service_date"].to_numpy(), horizon),
+            "trip_id": np.repeat(window_ends["trip_id"].to_numpy(), horizon),
             "route_id": np.repeat(window_ends["route_id"].to_numpy(), horizon),
-            "stops_ahead": np.tile(np.arange(1, horizon + 1), len(X)),
+            "stop_id": df["stop_id"].to_numpy()[target_rows],
+            "stops_ahead": stops_ahead,
+            "departure_time": np.repeat(
+                window_ends["departure_time"].to_numpy(), horizon
+            ),
             "actual": y.ravel(),
             "predicted": lstm.predict(X).ravel(),
             "scheduled": window_ends[lstm.scheduled_target_columns].to_numpy().ravel(),
@@ -146,10 +159,13 @@ def mbta_comparison(results: pd.DataFrame, mbta: pd.DataFrame) -> pd.DataFrame:
     predictions than we do (it keeps re-predicting every arrival), so our "all"
     weights each group by the MBTA's own count of predictions in it.
 
-    Not a perfect match: the MBTA scores predictions made at any moment,
-    including terminal departures and a train's first stops; ours are made as a
-    train leaves a stop, after its first few stops, and reach 10 stops ahead, so
-    our 12-30 min group leans toward its shorter end.
+    This overstates our advantage, so treat it as context, not a result: the
+    MBTA scores predictions made at any moment, including trains waiting at
+    terminals, held or stuck between stations; ours are made only as a train
+    leaves a stop, the easiest moment. On 2026-08-21..09-03 even the plain
+    schedule, scored this way on our moments, "beat" the MBTA by 10-20 points.
+    For a fair comparison use --mbta-predictions (mbta_predictions.py), which
+    compares with the MBTA's own predictions made at the same moments.
     """
     weeks = mbta_weeks(results["service_date"])
     if not weeks:
@@ -208,6 +224,33 @@ def _service_dates_in(week: str) -> list:
     return [int(day.strftime("%Y%m%d")) for day in days]
 
 
+def print_head_to_head(results: pd.DataFrame, feed_dir: str):
+    # Imported here: mbta_predictions imports from this module
+    from astrotrain.mbta_predictions import (
+        archive_files,
+        attach_mbta_predictions,
+        head_to_head,
+        load_mbta_predictions,
+    )
+
+    files = archive_files(Path(feed_dir), results["service_date"].unique())
+    if not files:
+        print(f"\nNo archived MBTA predictions in {feed_dir} for these days")
+        return
+    predictions = load_mbta_predictions(files)
+    report = head_to_head(attach_mbta_predictions(results, predictions))
+    print(
+        f"\nHead-to-head with the MBTA's own predictions, made at the same moments "
+        f"for the same trips and stops ({report['coverage']:.0%} of our targets "
+        "had one). Mean absolute error in seconds:\n"
+    )
+    print(report["by_stops_ahead"].to_string())
+    print()
+    print(report["by_route"].to_string())
+    print("\nPercent accurate by the MBTA's rules, on the same targets:\n")
+    print(report["accuracy"].to_string())
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Report a saved model's error in seconds against the schedule"
@@ -215,6 +258,12 @@ def main():
     parser.add_argument("files", nargs="+", help="LAMP parquet files to evaluate on")
     parser.add_argument(
         "--model", default="models/countdown_lstm", help="Saved model directory"
+    )
+    parser.add_argument(
+        "--mbta-predictions",
+        help="Feed folder of the MBTA's archived TripUpdates (trip_updates/feed=... "
+        "from us-rail-peformance-archiver), for a head-to-head with the MBTA's own "
+        "predictions made at the same moments",
     )
     parser.add_argument(
         "--mbta-accuracy",
@@ -237,12 +286,17 @@ def main():
     print()
     print(summarize(results, "route_id").to_string())
 
+    if args.mbta_predictions:
+        print_head_to_head(results, args.mbta_predictions)
+
     if args.mbta_accuracy:
         comparison = mbta_comparison(results, pd.read_csv(args.mbta_accuracy))
         weeks = ", ".join(mbta_weeks(results["service_date"]))
         print(
             f"\nPercent of predictions accurate by the MBTA's rules, for MBTA "
-            f"weeks {weeks}:\n"
+            f"weeks {weeks}. Context only: the MBTA's figures cover harder moments "
+            "than ours (see the schedule column); use --mbta-predictions for a "
+            "fair comparison.\n"
         )
         print(comparison.to_string())
 
