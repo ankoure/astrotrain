@@ -35,6 +35,10 @@ SUBWAY_ROUTES = [
 # older prediction isn't what the MBTA was showing at that moment
 MAX_PREDICTION_AGE_SECONDS = 120
 
+# For the check in the MBTA's favour: its first prediction made this soon after
+# our train left, when it too knows the train's stop is over
+AFTER_DEPARTURE_SECONDS = 60
+
 _COLUMNS = {
     "feed_timestamp": "made",
     "trip_update.trip.trip_id": "trip_id",
@@ -80,13 +84,18 @@ def load_mbta_predictions(files: List[Path]) -> pd.DataFrame:
 
 
 def attach_mbta_predictions(
-    results: pd.DataFrame, predictions: pd.DataFrame
+    results: pd.DataFrame, predictions: pd.DataFrame, after: bool = False
 ) -> pd.DataFrame:
     """
     Add "mbta": the MBTA's predicted seconds from departure_time to arriving at
     the target stop, from its latest prediction for that trip and stop made at
     or before departure_time and at most MAX_PREDICTION_AGE_SECONDS old. Missing
     where there was none.
+
+    With after=True, use instead its first prediction made in the
+    AFTER_DEPARTURE_SECONDS after departure_time. That's a check in the MBTA's
+    favour: a prediction made before the train left can't know how long its stop
+    will last, which is an edge for ours that comes from timing, not skill.
     """
     order = np.argsort(results["departure_time"].to_numpy(), kind="stable")
     ours = results.iloc[order].reset_index(names="_row")
@@ -97,8 +106,10 @@ def attach_mbta_predictions(
         left_on="departure_time",
         right_on="made",
         by=["trip_id", "stop_id"],
-        direction="backward",
-        tolerance=float(MAX_PREDICTION_AGE_SECONDS),
+        direction="forward" if after else "backward",
+        tolerance=float(
+            AFTER_DEPARTURE_SECONDS if after else MAX_PREDICTION_AGE_SECONDS
+        ),
     )
     mbta = pd.Series(np.nan, index=results.index)
     mbta.iloc[matched["_row"].to_numpy()] = (
@@ -131,14 +142,25 @@ def head_to_head(results: pd.DataFrame) -> dict:
         return table.round(1)
 
     keys = ["route_id", "bin"]
-    ours = score_like_mbta(both, "predicted").groupby(keys)["accurate"].mean()
-    theirs = score_like_mbta(both, "mbta").groupby(keys)["accurate"].mean()
-    accuracy = (100 * pd.DataFrame({"ours": ours, "mbta": theirs})).reset_index()
+    ours = score_like_mbta(both, "predicted").groupby(keys)["accurate"]
+    theirs = score_like_mbta(both, "mbta").groupby(keys)["accurate"]
+    accuracy = pd.DataFrame(
+        {
+            "ours": 100 * ours.mean(),
+            "mbta": 100 * theirs.mean(),
+            "ours_n": ours.size(),
+            "mbta_n": theirs.size(),
+        }
+    ).reset_index()
+    accuracy[["ours_n", "mbta_n"]] = (
+        accuracy[["ours_n", "mbta_n"]].fillna(0).astype(int)
+    )
     accuracy["bin"] = pd.Categorical(
         accuracy["bin"], [b[0] for b in MBTA_ACCURACY_BINS], ordered=True
     )
     accuracy = accuracy.sort_values(keys).set_index(keys)
     accuracy["ours_minus_mbta"] = accuracy["ours"] - accuracy["mbta"]
+    accuracy = accuracy[["ours", "mbta", "ours_minus_mbta", "ours_n", "mbta_n"]]
 
     return {
         "coverage": len(both) / len(results) if len(results) else 0.0,

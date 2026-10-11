@@ -250,6 +250,17 @@ def print_head_to_head(results: pd.DataFrame, feed_dir: str):
     print("\nPercent accurate by the MBTA's rules, on the same targets:\n")
     print(report["accuracy"].to_string())
 
+    # In the MBTA's favour: its first prediction after the train left, when it
+    # knows the stop is over too
+    after = head_to_head(attach_mbta_predictions(results, predictions, after=True))
+    overall = after["by_stops_ahead"].loc["all"]
+    print(
+        f"\nWith the MBTA's first prediction made after the train left instead "
+        f"(in its favour; {after['coverage']:.0%} coverage): ours {overall['ours']}s, "
+        f"MBTA {overall['mbta']}s ({overall['ours_vs_mbta']})\n"
+    )
+    print(after["by_route"].to_string())
+
 
 def main():
     parser = argparse.ArgumentParser(

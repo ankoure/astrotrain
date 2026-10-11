@@ -3,6 +3,7 @@ import pandas as pd
 import pytest
 
 from astrotrain.mbta_predictions import (
+    AFTER_DEPARTURE_SECONDS,
     MAX_PREDICTION_AGE_SECONDS,
     archive_files,
     attach_mbta_predictions,
@@ -131,3 +132,25 @@ def test_head_to_head_compares_on_targets_the_mbta_predicted():
     assert by_stops.loc["all", "ours_vs_mbta"] == "-50%"
     accuracy = report["accuracy"].loc[("Red", "0-3 min")]
     assert accuracy[["ours", "mbta"]].tolist() == [100.0, 100.0]
+    assert accuracy[["ours_n", "mbta_n"]].tolist() == [2, 2]
+
+
+def test_after_uses_the_first_prediction_made_soon_after_our_departure():
+    preds = predictions(
+        (T - 30, "t1", "70061", T + 120),  # before we left: not used
+        (T + 20, "t1", "70061", T + 110),  # the first after
+        (T + 50, "t1", "70061", T + 105),
+    )
+
+    out = attach_mbta_predictions(our_targets(), preds, after=True)
+
+    assert out["mbta"].tolist() == [110.0]
+
+
+def test_after_ignores_predictions_made_too_long_after():
+    late = T + AFTER_DEPARTURE_SECONDS + 1
+    preds = predictions((late, "t1", "70061", T + 100))
+
+    out = attach_mbta_predictions(our_targets(), preds, after=True)
+
+    assert np.isnan(out["mbta"].iloc[0])
